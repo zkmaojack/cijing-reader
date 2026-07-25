@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>词境精读</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32">
+              <path d="M8 5h11l5 5v17H8z" />
+              <path d="M19 5v6h6" />
+              <path d="M12 16h8M12 20h8M12 24h5" />
+            </svg>
+          </div>
+          <h1>词境精读</h1>
+        </div>
+        <div class="actions">
+          <button id="themeBtn" class="button ghost" type="button">
+            <span class="icon">◐</span><span id="themeLabel">深色</span>
+          </button>
+          <button id="demoBtn" class="button ghost" type="button">
+            <span class="icon">✦</span><span>演示</span>
+          </button>
+          <button id="clearBtn" class="button ghost" type="button">
+            <span class="icon">⌫</span><span>清空</span>
+          </button>
+          <details class="output-menu">
+            <summary class="button primary">
+              <span class="icon">⇩</span><span>输出</span>
+            </summary>
+            <div class="output-menu-panel">
+              <button id="pdfBtn" class="button ghost wide" type="button">
+                <span class="icon">⤓</span><span id="pdfLabel">下载 PDF</span>
+              </button>
+            </div>
+          </details>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <section class="editor">
+          <div class="section-head">
+            <div>
+              <h2>英文文章</h2>
+              <p>粘贴文章，右侧选择年级和标注规则。</p>
+            </div>
+            <div id="wordCount" class="pill">0 words</div>
+          </div>
+          <textarea id="article" spellcheck="false" placeholder="Paste English article here..."></textarea>
+        </section>
+
+        <section class="preview-panel">
+          <div class="section-head">
+            <div>
+              <h2>标注预览</h2>
+              <p>预览会跟随编辑栏同步更新，PDF 输出保持同样排版。</p>
+            </div>
+            <div id="previewStatus" class="pill">等待文章</div>
+          </div>
+          <div id="previewCanvas" class="preview-canvas">
+            <div class="preview-empty-state">粘贴英文文章后自动生成预览</div>
+          </div>
+        </section>
+
+        <aside class="settings">
+          <details class="settings-card collapsible-card" open>
+            <summary class="settings-summary">
+              <span>编辑栏</span>
+              <span class="chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div class="settings-content">
+            <label class="range-field">
+              <span>英文大小 <output id="englishSizeValue">13.5 pt</output></span>
+              <input id="englishSize" type="range" min="9" max="24" step="0.5" value="13.5" />
+            </label>
+            <label class="range-field">
+              <span>音标大小 <output id="ipaSizeValue">6.5 pt</output></span>
+              <input id="ipaSize" type="range" min="4" max="16" step="0.5" value="6.5" />
+            </label>
+            <label class="range-field">
+              <span>中文大小 <output id="zhSizeValue">6.5 pt</output></span>
+              <input id="zhSize" type="range" min="4" max="17" step="0.5" value="6.5" />
+            </label>
+            <label class="range-field">
+              <span>行间距 <output id="lineHeightValue">2.15</output></span>
+              <input id="lineHeight" type="range" min="1.45" max="3.2" step="0.05" value="2.15" />
+            </label>
+            <label class="range-field">
+              <span>单词间距 <output id="wordSpacingValue">0 pt</output></span>
+              <input id="wordSpacing" type="range" min="-0.5" max="12" step="0.5" value="0" />
+            </label>
+            <label>
+              <span>页面大小</span>
+              <select id="pageSize">
+                <option value="letter">Letter 8.5 × 11 in</option>
+                <option value="a4">A4 210 × 297 mm</option>
+                <option value="b5">B5 176 × 250 mm</option>
+                <option value="a5">A5 148 × 210 mm</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            <div id="customPageFields" class="custom-page-fields" hidden>
+              <label>
+                <span>页面宽度 mm</span>
+                <input id="customPageWidth" type="number" min="90" max="500" step="1" value="210" />
+              </label>
+              <label>
+                <span>页面高度 mm</span>
+                <input id="customPageHeight" type="number" min="120" max="700" step="1" value="297" />
+              </label>
+            </div>
+            </div>
+          </details>
+
+          <label>
+            <span>标题</span>
+            <input id="title" type="text" placeholder="例如：Lesson 37 The Tea Rose" />
+          </label>
+
+          <label>
+            <span>学生年级</span>
+            <select id="grade"></select>
+          </label>
+          <div class="grade-card">
+            <div class="meter"><span id="gradeMeter"></span></div>
+            <p id="gradeNote">正在读取年级配置...</p>
+          </div>
+
+          <label>
+            <span>自定义标注词</span>
+            <textarea id="customWords" class="small" spellcheck="false" placeholder="glittered stood&#10;glittered=ˈɡlɪt.ərd=闪闪发光"></textarea>
+          </label>
+          <div id="tagPreview" class="tags"></div>
+
+          <label class="check-option">
+            <input id="annotateUnknown" type="checkbox" checked />
+            <span>记录词典未收录词（正文不显示占位符）</span>
+          </label>
+
+          <details class="ai-card collapsible-card">
+            <summary class="settings-summary">
+              <span>AI/网络增强</span>
+              <span class="chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div class="settings-content">
+            <label>
+              <span>接口地址</span>
+              <input id="aiEndpoint" type="text" placeholder="OpenAI 兼容 /v1/chat/completions" />
+            </label>
+            <label>
+              <span>模型</span>
+              <input id="aiModel" type="text" placeholder="例如：gpt-4.1-mini 或服务商模型名" />
+            </label>
+            <label>
+              <span>API Key</span>
+              <input id="aiKey" type="password" placeholder="只在本次请求中使用" />
+            </label>
+            <button id="enhanceBtn" class="button ghost wide" type="button">
+              <span class="icon">✧</span><span id="enhanceLabel">增强标注</span>
+            </button>
+            </div>
+          </details>
+
+          <details class="ai-card collapsible-card">
+            <summary class="settings-summary">
+              <span>网络词库</span>
+              <span class="chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div class="settings-content">
+            <label>
+              <span>词库接口</span>
+              <input id="lexiconEndpoint" type="text" placeholder="例如：https://api.example.com/dict/{word}" />
+            </label>
+            <label>
+              <span>词库 Key</span>
+              <input id="lexiconKey" type="password" placeholder="可选，只在本次请求中使用" />
+            </label>
+            <button id="lexiconBtn" class="button ghost wide" type="button">
+              <span class="icon">⌁</span><span id="lexiconLabel">查询词库</span>
+            </button>
+            </div>
+          </details>
+
+          <section id="resultCard" class="result" hidden>
+            <div class="result-icon">✓</div>
+            <div>
+              <h3 id="resultTitle">文件已生成</h3>
+              <p id="resultMeta">PDF 已开始下载。</p>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

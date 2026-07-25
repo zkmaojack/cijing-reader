@@ -1,0 +1,5 @@
+/target/
+/target-verify/
+/output/
+*.exe
+*.log
