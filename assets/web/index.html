@@ -2,7 +2,10 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
     <title>词境精读</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -34,6 +37,9 @@
               <span class="icon">⇩</span><span>输出</span>
             </summary>
             <div class="output-menu-panel">
+              <button id="docxBtn" class="button ghost wide" type="button">
+                <span class="icon">W</span><span id="docxLabel">下载 DOCX</span>
+              </button>
               <button id="pdfBtn" class="button ghost wide" type="button">
                 <span class="icon">⤓</span><span id="pdfLabel">下载 PDF</span>
               </button>
@@ -42,30 +48,142 @@
         </div>
       </header>
 
-      <section class="workspace">
+      <section id="workspace" class="workspace">
         <section class="editor">
           <div class="section-head">
             <div>
               <h2>英文文章</h2>
-              <p>粘贴文章，右侧选择年级和标注规则。</p>
+              <p>支持查找替换、草稿历史，以及选词、选句和段落批注。</p>
             </div>
             <div id="wordCount" class="pill">0 words</div>
           </div>
-          <textarea id="article" spellcheck="false" placeholder="Paste English article here..."></textarea>
+          <div class="editor-toolbar" role="toolbar" aria-label="文章编辑工具">
+            <div class="editor-tool-group">
+              <button class="tool-button" type="button" data-editor-action="undo" title="撤销 Ctrl+Z">
+                <span aria-hidden="true">↶</span><span>撤销</span>
+              </button>
+              <button class="tool-button" type="button" data-editor-action="redo" title="重做 Ctrl+Y">
+                <span aria-hidden="true">↷</span><span>重做</span>
+              </button>
+              <button class="tool-button" type="button" data-editor-action="find" title="查找 Ctrl+F">
+                <span aria-hidden="true">⌕</span><span>查找</span>
+              </button>
+              <button class="tool-button" type="button" data-editor-action="history">
+                <span aria-hidden="true">◷</span><span>历史</span>
+              </button>
+            </div>
+            <div class="editor-tool-group">
+              <button class="tool-button" type="button" data-editor-action="cleanup">
+                <span aria-hidden="true">≋</span><span>清理格式</span>
+              </button>
+              <button class="tool-button" type="button" data-editor-action="normalize">
+                <span aria-hidden="true">Aa</span><span>英文规范</span>
+              </button>
+              <button class="tool-button" type="button" data-editor-action="vocabulary">
+                <span aria-hidden="true">▦</span><span>词汇管理</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="findPanel" class="find-panel" hidden>
+            <label>
+              <span class="sr-only">查找内容</span>
+              <input id="findText" type="text" placeholder="查找内容" />
+            </label>
+            <label>
+              <span class="sr-only">替换内容</span>
+              <input id="replaceText" type="text" placeholder="替换为" />
+            </label>
+            <label class="inline-check">
+              <input id="findCaseSensitive" type="checkbox" />
+              <span>区分大小写</span>
+            </label>
+            <button id="findNextBtn" class="tool-button" type="button">下一个</button>
+            <button id="replaceBtn" class="tool-button" type="button">替换</button>
+            <button id="replaceAllBtn" class="tool-button" type="button">全部替换</button>
+            <button id="findCloseBtn" class="tool-button icon-only" type="button" aria-label="关闭查找">×</button>
+            <span id="findStatus" class="find-status" aria-live="polite"></span>
+          </div>
+
+          <div id="selectionBar" class="selection-bar" hidden>
+            <span id="selectionSummary" class="selection-summary">已选择文本</span>
+            <button class="tool-button" type="button" data-selection-action="word">词条</button>
+            <button class="tool-button" type="button" data-selection-action="dictionary">词典</button>
+            <button class="tool-button" type="button" data-selection-action="sentence">句子解析</button>
+            <button class="tool-button" type="button" data-selection-action="paragraph">段落批注</button>
+            <span class="color-label">高亮</span>
+            <button class="color-dot yellow" type="button" data-highlight-color="yellow" aria-label="黄色高亮"></button>
+            <button class="color-dot green" type="button" data-highlight-color="green" aria-label="绿色高亮"></button>
+            <button class="color-dot blue" type="button" data-highlight-color="blue" aria-label="蓝色高亮"></button>
+            <button class="color-dot pink" type="button" data-highlight-color="pink" aria-label="粉色高亮"></button>
+            <button class="color-dot orange" type="button" data-highlight-color="orange" aria-label="橙色高亮"></button>
+          </div>
+
+          <div class="article-editor-wrap">
+            <div id="articleHighlights" class="article-highlights" aria-hidden="true">
+              <div id="articleHighlightsContent" class="article-highlights-content"></div>
+            </div>
+            <textarea id="article" spellcheck="true" placeholder="Paste English article here..."></textarea>
+          </div>
+          <footer class="editor-footer">
+            <span id="textStats">0 词 · 0 句 · 0 段 · 0 分钟</span>
+            <div class="editor-footer-actions">
+              <button id="resetArticleHeightBtn" class="text-button" type="button">恢复输入框高度</button>
+              <span id="draftStatus">等待编辑</span>
+            </div>
+          </footer>
         </section>
+
+        <div
+          id="leftPaneResizer"
+          class="pane-resizer"
+          role="separator"
+          aria-label="调整英文文章和标注预览的宽度"
+          aria-orientation="vertical"
+          aria-valuemin="20"
+          aria-valuemax="60"
+          tabindex="0"
+        ></div>
 
         <section class="preview-panel">
           <div class="section-head">
             <div>
               <h2>标注预览</h2>
-              <p>预览会跟随编辑栏同步更新，PDF 输出保持同样排版。</p>
+              <p>预览会跟随编辑栏同步更新，DOCX / PDF 保持同样排版。</p>
             </div>
             <div id="previewStatus" class="pill">等待文章</div>
+          </div>
+          <div class="preview-toolbar" role="toolbar" aria-label="预览缩放工具">
+            <button id="previewZoomOutBtn" class="tool-button icon-only" type="button" aria-label="缩小预览" title="缩小预览">
+              −
+            </button>
+            <button id="previewZoomValue" class="zoom-value" type="button" title="恢复 100%">适合宽度</button>
+            <button id="previewZoomInBtn" class="tool-button icon-only" type="button" aria-label="放大预览" title="放大预览">
+              ＋
+            </button>
+            <span class="toolbar-divider" aria-hidden="true"></span>
+            <button id="previewFitBtn" class="tool-button active" type="button">
+              <span aria-hidden="true">↔</span><span>适合宽度</span>
+            </button>
+            <button id="previewFocusBtn" class="tool-button" type="button">
+              <span aria-hidden="true">⛶</span><span id="previewFocusLabel">放大查看</span>
+            </button>
           </div>
           <div id="previewCanvas" class="preview-canvas">
             <div class="preview-empty-state">粘贴英文文章后自动生成预览</div>
           </div>
         </section>
+
+        <div
+          id="rightPaneResizer"
+          class="pane-resizer"
+          role="separator"
+          aria-label="调整标注预览和编辑栏的宽度"
+          aria-orientation="vertical"
+          aria-valuemin="40"
+          aria-valuemax="80"
+          tabindex="0"
+        ></div>
 
         <aside class="settings">
           <details class="settings-card collapsible-card" open>
@@ -137,6 +255,16 @@
           </label>
           <div id="tagPreview" class="tags"></div>
 
+          <details class="settings-card collapsible-card annotation-card" open>
+            <summary class="settings-summary">
+              <span>标注记录 <small id="annotationCount">0</small></span>
+              <span class="chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div id="annotationList" class="annotation-list">
+              <p class="annotation-empty">选择单词、句子或段落后即可添加标注。</p>
+            </div>
+          </details>
+
           <label class="check-option">
             <input id="annotateUnknown" type="checkbox" checked />
             <span>记录词典未收录词（正文不显示占位符）</span>
@@ -190,13 +318,168 @@
             <div class="result-icon">✓</div>
             <div>
               <h3 id="resultTitle">文件已生成</h3>
-              <p id="resultMeta">PDF 已开始下载。</p>
+              <p id="resultMeta">文件已开始下载。</p>
             </div>
           </section>
         </aside>
       </section>
     </main>
+    <div id="dictionaryPopover" class="dictionary-popover" hidden>
+      <div class="dictionary-head">
+        <div>
+          <strong id="dictionaryWord">Dictionary</strong>
+          <span id="dictionaryIpa"></span>
+        </div>
+        <button id="dictionaryCloseBtn" class="tool-button icon-only" type="button" aria-label="关闭词典">×</button>
+      </div>
+      <p id="dictionaryDefinition">正在查询本地词典…</p>
+      <p id="dictionaryForms" class="dictionary-forms"></p>
+      <button id="dictionaryAnnotateBtn" class="button primary wide" type="button">加入词汇标注</button>
+    </div>
+
+    <dialog id="wordDialog" class="editor-dialog">
+      <form id="wordForm" method="dialog">
+        <header class="dialog-head">
+          <div>
+            <h3>词汇标注</h3>
+            <p>音标和释义会同步到自定义词表与输出预览。</p>
+          </div>
+          <button class="tool-button icon-only" type="button" data-dialog-close aria-label="关闭">×</button>
+        </header>
+        <div class="dialog-grid">
+          <label>
+            <span>单词</span>
+            <input id="wordTerm" type="text" required />
+          </label>
+          <label>
+            <span>标注类型</span>
+            <select id="wordStatus">
+              <option value="new">生词</option>
+              <option value="important">重点词</option>
+              <option value="ignore">忽略标注</option>
+            </select>
+          </label>
+          <label>
+            <span>音标</span>
+            <input id="wordIpa" type="text" placeholder="例如：ˈɡlɪt.ərd" />
+          </label>
+          <label>
+            <span>中文释义</span>
+            <input id="wordDefinition" type="text" placeholder="当前语境中的释义" />
+          </label>
+          <label>
+            <span>高亮颜色</span>
+            <select id="wordColor">
+              <option value="yellow">黄色</option>
+              <option value="orange">橙色</option>
+              <option value="green">绿色</option>
+              <option value="blue">蓝色</option>
+              <option value="pink">粉色</option>
+            </select>
+          </label>
+          <label class="dialog-full">
+            <span>学习备注</span>
+            <textarea id="wordNote" class="small" placeholder="词形、搭配或易错点"></textarea>
+          </label>
+        </div>
+        <p id="wordLookupStatus" class="dialog-status"></p>
+        <footer class="dialog-actions">
+          <button class="button ghost" type="button" data-dialog-close>取消</button>
+          <button class="button primary" type="submit">保存词条</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="noteDialog" class="editor-dialog">
+      <form id="noteForm" method="dialog">
+        <header class="dialog-head">
+          <div>
+            <h3 id="noteDialogTitle">添加解析</h3>
+            <p id="noteExcerpt" class="dialog-excerpt"></p>
+          </div>
+          <button class="tool-button icon-only" type="button" data-dialog-close aria-label="关闭">×</button>
+        </header>
+        <div class="dialog-grid">
+          <label>
+            <span>标注类型</span>
+            <select id="noteKind">
+              <option value="grammar">语法解析</option>
+              <option value="pattern">句型结构</option>
+              <option value="complex">长难句</option>
+              <option value="teacher">教师批注</option>
+              <option value="tip">学习提示</option>
+            </select>
+          </label>
+          <label>
+            <span>高亮颜色</span>
+            <select id="noteColor">
+              <option value="blue">蓝色</option>
+              <option value="green">绿色</option>
+              <option value="yellow">黄色</option>
+              <option value="pink">粉色</option>
+              <option value="orange">橙色</option>
+            </select>
+          </label>
+          <label class="dialog-full">
+            <span>解析或批注</span>
+            <textarea id="noteText" class="small" required placeholder="输入语法说明、句型结构或学习建议"></textarea>
+          </label>
+        </div>
+        <footer class="dialog-actions">
+          <button class="button ghost" type="button" data-dialog-close>取消</button>
+          <button class="button primary" type="submit">保存标注</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="historyDialog" class="editor-dialog history-dialog">
+      <div>
+        <header class="dialog-head">
+          <div>
+            <h3>草稿历史</h3>
+            <p>自动保留最近 20 个版本。</p>
+          </div>
+          <button class="tool-button icon-only" type="button" data-dialog-close aria-label="关闭">×</button>
+        </header>
+        <div id="historyList" class="history-list"></div>
+      </div>
+    </dialog>
+
+    <dialog id="vocabularyDialog" class="editor-dialog vocabulary-dialog">
+      <form id="vocabularyForm" method="dialog">
+        <header class="dialog-head">
+          <div>
+            <h3>批量词汇管理</h3>
+            <p>统一编辑生词、重点词和忽略词。</p>
+          </div>
+          <button class="tool-button icon-only" type="button" data-dialog-close aria-label="关闭">×</button>
+        </header>
+        <div class="vocabulary-table-wrap">
+          <table class="vocabulary-table">
+            <thead>
+              <tr>
+                <th>单词</th>
+                <th>音标</th>
+                <th>释义</th>
+                <th>类型</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="vocabularyRows"></tbody>
+          </table>
+        </div>
+        <footer class="dialog-actions spread">
+          <button id="addVocabularyRowBtn" class="button ghost" type="button">＋ 添加词条</button>
+          <div>
+            <button class="button ghost" type="button" data-dialog-close>取消</button>
+            <button class="button primary" type="submit">保存全部</button>
+          </div>
+        </footer>
+      </form>
+    </dialog>
+
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/editor-tools.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>

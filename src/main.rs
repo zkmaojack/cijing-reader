@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INDEX_HTML: &str = include_str!("../assets/web/index.html");
 const APP_JS: &str = include_str!("../assets/web/app.js");
+const EDITOR_TOOLS_JS: &str = include_str!("../assets/web/editor-tools.js");
 const STYLES_CSS: &str = include_str!("../assets/web/styles.css");
 const PROFILES_TSV: &str = include_str!("../assets/data/profiles.tsv");
 const TIERS_TSV: &str = include_str!("../assets/data/tiers.tsv");
@@ -23,6 +24,8 @@ const ECDICT_TSV: &[u8] = include_bytes!("../assets/data/ecdict.tsv");
 const CMUDICT: &[u8] = include_bytes!("../assets/data/cmudict.dict");
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct GradeProfile {
@@ -216,6 +219,7 @@ fn normalize_key(term: &str) -> String {
         .trim()
         .to_ascii_lowercase()
         .replace(['’', '‘'], "'")
+        .replace(['‐', '‑', '‒', '–', '—', '―'], "-")
         .replace(['“', '”', '"'], "");
 
     let start = value
@@ -333,18 +337,29 @@ fn add_entry(lexicon: &mut HashMap<String, LexiconEntry>, entry: LexiconEntry) {
     }
 }
 
-fn parse_custom_annotations(custom_text: &str) -> (Vec<LexiconEntry>, Vec<String>) {
+fn parse_custom_annotations(custom_text: &str) -> (Vec<LexiconEntry>, Vec<String>, Vec<String>) {
     let mut entries = Vec::new();
     let mut force_terms = Vec::new();
+    let mut ignored_terms = Vec::new();
     let text = custom_text.trim();
     if text.is_empty() {
-        return (entries, force_terms);
+        return (entries, force_terms, ignored_terms);
     }
 
     let mut rich_lines = Vec::new();
     let mut plain_chunks = Vec::new();
     for line in text.lines() {
-        let stripped = line.trim();
+        let mut stripped = line.trim();
+        if stripped.is_empty() {
+            continue;
+        }
+        if let Some(ignored) = stripped.strip_prefix('!') {
+            ignored_terms.extend(split_terms(ignored));
+            continue;
+        }
+        if let Some(important) = stripped.strip_prefix('*') {
+            stripped = important.trim();
+        }
         if stripped.is_empty() {
             continue;
         }
@@ -376,10 +391,10 @@ fn parse_custom_annotations(custom_text: &str) -> (Vec<LexiconEntry>, Vec<String
                 zh: parts[2].clone(),
                 hard: true,
             });
-        } else if let Some(first) = parts.first() {
-            if !first.is_empty() {
-                force_terms.push(first.clone());
-            }
+        } else if let Some(first) = parts.first()
+            && !first.is_empty()
+        {
+            force_terms.push(first.clone());
         }
     }
 
@@ -390,7 +405,7 @@ fn parse_custom_annotations(custom_text: &str) -> (Vec<LexiconEntry>, Vec<String
             }
         }
     }
-    (entries, force_terms)
+    (entries, force_terms, ignored_terms)
 }
 
 fn split_terms(text: &str) -> Vec<String> {
@@ -450,16 +465,16 @@ fn lookup_generated_ipa(state: &AppState, word: &str) -> Option<String> {
             candidate.replace('-', ""),
         ];
         for variant in variants {
-            if let Some(found) = state.pronunciations.get(&variant) {
-                if let Some(pronunciation) = found.iter().min_by_key(|phones| {
+            if let Some(found) = state.pronunciations.get(&variant)
+                && let Some(pronunciation) = found.iter().min_by_key(|phones| {
                     let primary = phones.iter().filter(|phone| phone.ends_with('1')).count();
                     let secondary = phones.iter().filter(|phone| phone.ends_with('2')).count();
                     (primary.abs_diff(1), secondary, phones.len())
-                }) {
-                    let ipa = arpabet_to_ipa(pronunciation);
-                    if !ipa.is_empty() {
-                        return Some(ipa);
-                    }
+                })
+            {
+                let ipa = arpabet_to_ipa(pronunciation);
+                if !ipa.is_empty() {
+                    return Some(ipa);
                 }
             }
         }
@@ -549,11 +564,11 @@ fn arpabet_to_ipa(phonemes: &[String]) -> String {
 }
 
 fn split_arpabet_stress(phoneme: &str) -> (&str, Option<char>) {
-    if let Some(last) = phoneme.chars().last() {
-        if matches!(last, '0' | '1' | '2') {
-            let cut = phoneme.len() - last.len_utf8();
-            return (&phoneme[..cut], Some(last));
-        }
+    if let Some(last) = phoneme.chars().last()
+        && matches!(last, '0' | '1' | '2')
+    {
+        let cut = phoneme.len() - last.len_utf8();
+        return (&phoneme[..cut], Some(last));
     }
     (phoneme, None)
 }
@@ -931,6 +946,7 @@ struct AnnotationItem {
     annotation: Option<AnnotationParts>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_docx(
     state: &AppState,
     article_text: &str,
@@ -955,7 +971,7 @@ fn generate_docx(
             &mut lexicon,
             &hard_terms,
             profile,
-            known_words,
+            &known_words,
             annotate_unknown,
             &mut missing_terms,
         );
@@ -980,7 +996,7 @@ fn generate_docx(
             &mut lexicon,
             &hard_terms,
             profile,
-            known_words,
+            &known_words,
             annotate_unknown,
             &mut missing_terms,
         );
@@ -1030,7 +1046,7 @@ fn render_preview_html(
             &mut lexicon,
             &hard_terms,
             profile,
-            known_words,
+            &known_words,
             annotate_unknown,
             &mut missing_terms,
         );
@@ -1051,7 +1067,7 @@ fn render_preview_html(
             &mut lexicon,
             &hard_terms,
             profile,
-            known_words,
+            &known_words,
             annotate_unknown,
             &mut missing_terms,
         );
@@ -1143,7 +1159,7 @@ fn printable_preview_html(preview_html: &str, sizes: TextSizes) -> String {
 
 fn hps_to_points(hps: usize) -> String {
     let whole = hps / 2;
-    if hps % 2 == 0 {
+    if hps.is_multiple_of(2) {
         whole.to_string()
     } else {
         format!("{whole}.5")
@@ -1258,10 +1274,10 @@ fn run_pdf_browser_attempt(
 fn wait_for_nonempty_file(path: &Path, timeout: Duration) -> bool {
     let started = Instant::now();
     loop {
-        if let Ok(metadata) = fs::metadata(path) {
-            if metadata.len() > 0 {
-                return true;
-            }
+        if let Ok(metadata) = fs::metadata(path)
+            && metadata.len() > 0
+        {
+            return true;
         }
         if started.elapsed() >= timeout {
             return false;
@@ -1361,30 +1377,36 @@ fn prepare_article_text(article_text: &str, title: &str) -> Result<String, Strin
     Ok(article_text)
 }
 
+type AnnotationContext<'a> = (
+    HashMap<String, LexiconEntry>,
+    HashSet<String>,
+    &'a GradeProfile,
+    HashSet<String>,
+);
+
 fn annotation_context<'a>(
     state: &'a AppState,
     custom_annotations: &str,
     grade_code: &str,
-) -> Result<
-    (
-        HashMap<String, LexiconEntry>,
-        HashSet<String>,
-        &'a GradeProfile,
-        &'a HashSet<String>,
-    ),
-    String,
-> {
+) -> Result<AnnotationContext<'a>, String> {
     let mut lexicon = state.seed_lexicon.clone();
-    let (custom_entries, custom_force_terms) = parse_custom_annotations(custom_annotations);
+    let (custom_entries, custom_force_terms, ignored_terms) =
+        parse_custom_annotations(custom_annotations);
     for entry in custom_entries {
         add_entry(&mut lexicon, entry);
     }
     let hard_terms = extract_hard_terms(&custom_force_terms.join(" "), &lexicon);
     let profile = state.profile(grade_code);
-    let known_words = state
+    let mut known_words = state
         .known_words
         .get(&profile.code)
-        .ok_or_else(|| "年级配置不可用。".to_string())?;
+        .ok_or_else(|| "年级配置不可用。".to_string())?
+        .clone();
+    for ignored in ignored_terms {
+        for key in key_variants(&ignored) {
+            known_words.insert(key);
+        }
+    }
     Ok((lexicon, hard_terms, profile, known_words))
 }
 
@@ -1504,10 +1526,10 @@ fn xml_attr_numbers(xml: &str, tag_prefix: &str, attr: &str) -> Vec<usize> {
         let pattern = format!("{attr}=\"");
         if let Some(attr_start) = tag.find(&pattern) {
             let value_start = attr_start + pattern.len();
-            if let Some(value_end) = tag[value_start..].find('"') {
-                if let Ok(value) = tag[value_start..value_start + value_end].parse::<usize>() {
-                    values.push(value);
-                }
+            if let Some(value_end) = tag[value_start..].find('"')
+                && let Ok(value) = tag[value_start..value_start + value_end].parse::<usize>()
+            {
+                values.push(value);
             }
         }
         rest = &rest[tag_end + 1..];
@@ -1872,9 +1894,7 @@ fn estimate_docx_text_width(text: &str, hps: usize) -> usize {
         .map(|ch| {
             let factor = if is_cjk(ch) {
                 17.0
-            } else if ch.is_whitespace() {
-                5.0
-            } else if "ilI.,'`!|:;()[]{}".contains(ch) {
+            } else if ch.is_whitespace() || "ilI.,'`!|:;()[]{}".contains(ch) {
                 5.0
             } else if "mwMW@#%&".contains(ch) {
                 12.0
@@ -2087,6 +2107,11 @@ fn items_to_preview_html(items: &[AnnotationItem]) -> String {
                 ));
             }
             html.push_str("</rt></ruby>");
+        } else if is_word_token(&item.text) {
+            html.push_str(&format!(
+                "<span class=\"preview-base\">{}</span>",
+                xml_escape(&item.text)
+            ));
         } else {
             html.push_str(&xml_escape(&item.text));
         }
@@ -2121,16 +2146,19 @@ fn run_props_xml(
 }
 
 fn build_docx(paragraphs: &[String], sizes: TextSizes) -> Result<Vec<u8>, String> {
+    let (page_width_twips, page_height_twips) = page_size_twips(sizes.page_size);
     let document_xml = format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
             "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" ",
             "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ",
             "xmlns:xml=\"http://www.w3.org/XML/1998/namespace\"><w:body>{}",
-            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>",
+            "<w:sectPr><w:pgSz w:w=\"{}\" w:h=\"{}\"/><w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>",
             "</w:body></w:document>"
         ),
-        paragraphs.join("")
+        paragraphs.join(""),
+        page_width_twips,
+        page_height_twips
     );
     let styles_xml = format!(
         concat!(
@@ -2175,6 +2203,18 @@ fn build_docx(paragraphs: &[String], sizes: TextSizes) -> Result<Vec<u8>, String
     zip.add("word/styles.xml", styles_xml.as_bytes())?;
     zip.add("word/settings.xml", settings.as_bytes())?;
     Ok(zip.finish())
+}
+
+fn page_size_twips(page_size: PageSize) -> (usize, usize) {
+    let to_twips = |value: f32| {
+        let inches = if page_size.unit == "mm" {
+            value / 25.4
+        } else {
+            value
+        };
+        (inches * 1440.0).round().max(1.0) as usize
+    };
+    (to_twips(page_size.width), to_twips(page_size.height))
 }
 
 fn xml_escape(text: &str) -> String {
@@ -2310,6 +2350,59 @@ fn profiles_json(state: &AppState) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"profiles\":[{profiles}],\"default_grade\":\"P4\"}}")
+}
+
+fn handle_dictionary(state: &AppState, body: &str) -> (u16, String) {
+    let word = json_string(body, "word").unwrap_or_default();
+    let word = word.trim();
+    if word.is_empty() || word.len() > 120 {
+        return (400, "{\"error\":\"请输入需要查询的英文单词\"}".to_string());
+    }
+
+    let mut forms = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in candidate_lemmas(word) {
+        if seen.insert(candidate.clone()) {
+            forms.push(candidate);
+        }
+    }
+    let mut lexicon = state.seed_lexicon.clone();
+    let entry = lookup_entry(state, word, &mut lexicon);
+    if let Some(entry) = entry {
+        if seen.insert(entry.term.clone()) {
+            forms.insert(0, entry.term.clone());
+        }
+        let forms_json = forms
+            .iter()
+            .map(|form| format!("\"{}\"", json_escape(form)))
+            .collect::<Vec<_>>()
+            .join(",");
+        (
+            200,
+            format!(
+                "{{\"ok\":true,\"found\":true,\"word\":\"{}\",\"term\":\"{}\",\"ipa\":\"{}\",\"definition\":\"{}\",\"forms\":[{}]}}",
+                json_escape(word),
+                json_escape(&entry.term),
+                json_escape(&entry.ipa),
+                json_escape(&entry.zh),
+                forms_json
+            ),
+        )
+    } else {
+        let forms_json = forms
+            .iter()
+            .map(|form| format!("\"{}\"", json_escape(form)))
+            .collect::<Vec<_>>()
+            .join(",");
+        (
+            200,
+            format!(
+                "{{\"ok\":true,\"found\":false,\"word\":\"{}\",\"forms\":[{}]}}",
+                json_escape(word),
+                forms_json
+            ),
+        )
+    }
 }
 
 fn handle_preview(state: &AppState, body: &str) -> (u16, String) {
@@ -2458,6 +2551,53 @@ fn handle_generate_pdf(state: &AppState, body: &str) -> (u16, String) {
     }
 }
 
+fn handle_generate_docx(state: &AppState, body: &str) -> (u16, String) {
+    let article = json_string(body, "article").unwrap_or_default();
+    let title = json_string(body, "title").unwrap_or_default();
+    let grade = json_string(body, "grade").unwrap_or_else(|| "P4".to_string());
+    let custom_words = json_string(body, "customWords").unwrap_or_default();
+    let annotate_unknown = json_bool(body, "annotateUnknown").unwrap_or(true);
+    let sizes = text_sizes_from_json(body);
+    if article.trim().is_empty() {
+        return (400, "{\"error\":\"请先粘贴英文文章。\"}".to_string());
+    }
+
+    let filename = format!(
+        "{}_{}.docx",
+        safe_title(if title.trim().is_empty() {
+            "annotated_article"
+        } else {
+            &title
+        }),
+        unique_suffix()
+    );
+    let output_path = app_output_dir().join(&filename);
+    match generate_docx(
+        state,
+        &article,
+        &output_path,
+        &title,
+        &custom_words,
+        annotate_unknown,
+        &grade,
+        sizes,
+    ) {
+        Ok(missing) => {
+            let download_url = format!("/download/{}", url_encode(&filename));
+            (
+                200,
+                format!(
+                    "{{\"ok\":true,\"filename\":\"{}\",\"downloadUrl\":\"{}\",\"missingCount\":{}}}",
+                    json_escape(&filename),
+                    json_escape(&download_url),
+                    missing.len()
+                ),
+            )
+        }
+        Err(error) => (400, format!("{{\"error\":\"{}\"}}", json_escape(&error))),
+    }
+}
+
 fn network_lexicon_candidates(
     state: &AppState,
     article: &str,
@@ -2486,7 +2626,7 @@ fn network_lexicon_candidates(
             entry.as_ref(),
             &hard_terms,
             profile,
-            known_words,
+            &known_words,
         ) {
             seen.insert(key.clone());
             words.push(key);
@@ -2903,10 +3043,10 @@ fn json_string(body: &str, key: &str) -> Option<String> {
                     'f' => out.push('\u{000c}'),
                     'u' => {
                         if index + 4 <= body.len() {
-                            if let Ok(value) = u16::from_str_radix(&body[index..index + 4], 16) {
-                                if let Some(decoded) = char::from_u32(value as u32) {
-                                    out.push(decoded);
-                                }
+                            if let Ok(value) = u16::from_str_radix(&body[index..index + 4], 16)
+                                && let Some(decoded) = char::from_u32(value as u32)
+                            {
+                                out.push(decoded);
                             }
                             index += 4;
                         }
@@ -3000,11 +3140,11 @@ fn url_decode(text: &str) -> String {
         if byte == b'%' {
             let a = iter.next();
             let b = iter.next();
-            if let (Some(a), Some(b)) = (a, b) {
-                if let Ok(value) = u8::from_str_radix(&format!("{}{}", a as char, b as char), 16) {
-                    bytes.push(value);
-                    continue;
-                }
+            if let (Some(a), Some(b)) = (a, b)
+                && let Ok(value) = u8::from_str_radix(&format!("{}{}", a as char, b as char), 16)
+            {
+                bytes.push(value);
+                continue;
             }
             bytes.push(byte);
         } else if byte == b'+' {
@@ -3030,7 +3170,7 @@ fn handle_client(mut stream: TcpStream, state: Arc<AppState>) {
         _ => "Internal Server Error",
     };
     let mut response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: {mime}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: {mime}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'\r\nCross-Origin-Resource-Policy: same-origin\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
         body_bytes.len()
     );
     for header in extra_headers {
@@ -3054,6 +3194,9 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, String), Stri
         }
         data.extend_from_slice(&buf[..read]);
         if header_end.is_none() {
+            if data.len() > MAX_HTTP_HEADER_BYTES {
+                return Err("HTTP 请求头过大。".to_string());
+            }
             header_end = find_subsequence(&data, b"\r\n\r\n");
             if let Some(end) = header_end {
                 let headers = String::from_utf8_lossy(&data[..end]);
@@ -3068,6 +3211,9 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, String), Stri
                         }
                     })
                     .unwrap_or(0);
+                if content_length > MAX_HTTP_BODY_BYTES {
+                    return Err("HTTP 请求正文过大。".to_string());
+                }
             }
         }
         if let Some(end) = header_end {
@@ -3106,12 +3252,10 @@ fn route_request(
     body: &str,
 ) -> (u16, &'static str, Vec<u8>, Vec<String>) {
     let path = raw_path.split('?').next().unwrap_or("/");
-    if method == "OPTIONS" {
-        return (204, "text/plain; charset=utf-8", Vec::new(), Vec::new());
-    }
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => html(INDEX_HTML),
         ("GET", "/app.js") => text(APP_JS, "text/javascript; charset=utf-8"),
+        ("GET", "/editor-tools.js") => text(EDITOR_TOOLS_JS, "text/javascript; charset=utf-8"),
         ("GET", "/styles.css") => text(STYLES_CSS, "text/css; charset=utf-8"),
         ("GET", "/api/profiles") => json(200, profiles_json(state)),
         ("GET", "/api/demo") => json(
@@ -3125,8 +3269,16 @@ fn route_request(
             let (status, payload) = handle_generate_pdf(state, body);
             json(status, payload)
         }
+        ("POST", "/api/generate-docx") => {
+            let (status, payload) = handle_generate_docx(state, body);
+            json(status, payload)
+        }
         ("POST", "/api/preview") => {
             let (status, payload) = handle_preview(state, body);
+            json(status, payload)
+        }
+        ("POST", "/api/dictionary") => {
+            let (status, payload) = handle_dictionary(state, body);
             json(status, payload)
         }
         ("POST", "/api/ai-enhance") => {
@@ -3161,7 +3313,13 @@ fn json(status: u16, body: String) -> (u16, &'static str, Vec<u8>, Vec<String>) 
 
 fn serve_download(path: &str) -> (u16, &'static str, Vec<u8>, Vec<String>) {
     let filename = url_decode(path.trim_start_matches("/download/"));
-    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+    if filename.is_empty()
+        || filename.len() > 200
+        || filename.chars().any(char::is_control)
+        || filename.contains("..")
+        || filename.contains('/')
+        || filename.contains('\\')
+    {
         return json(404, "{\"error\":\"File not found\"}".to_string());
     }
     let file_path = app_output_dir().join(&filename);
@@ -3180,8 +3338,11 @@ fn serve_download(path: &str) -> (u16, &'static str, Vec<u8>, Vec<String>) {
 }
 
 fn download_mime(filename: &str) -> &'static str {
-    let _ = filename;
-    "application/pdf"
+    if filename.to_ascii_lowercase().ends_with(".docx") {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    } else {
+        "application/pdf"
+    }
 }
 
 fn app_output_dir() -> PathBuf {
@@ -3217,8 +3378,31 @@ fn open_browser(url: &str) {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn should_use_embedded_ui(args: &[String]) -> bool {
+    !args
+        .iter()
+        .any(|arg| arg == "--browser" || arg == "--native" || arg == "--no-open")
+}
+
+fn serve(listener: TcpListener, state: Arc<AppState>) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let state = Arc::clone(&state);
+                thread::spawn(move || handle_client(stream, state));
+            }
+            Err(error) => eprintln!("连接失败: {error}"),
+        }
+    }
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
+
+    #[cfg(target_os = "windows")]
+    windows_gui::enable_high_dpi();
+
     let state = Arc::new(AppState::load()?);
 
     if args.get(1).is_some_and(|arg| arg == "--generate-demo") {
@@ -3246,26 +3430,32 @@ fn main() -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     if args.iter().any(|arg| arg == "--native") {
-        windows_gui::run(state)?;
+        windows_gui::run_native(state)?;
         return Ok(());
     }
 
     let no_open = args.iter().any(|arg| arg == "--no-open");
     let (listener, port) = bind_server()?;
     let url = format!("http://127.0.0.1:{port}/");
+
+    // A normal Windows launch hosts the complete web interface in a WebView2
+    // child window. The local HTTP server stays private to this process.
+    #[cfg(target_os = "windows")]
+    if should_use_embedded_ui(&args) {
+        let server_state = Arc::clone(&state);
+        thread::spawn(move || serve(listener, server_state));
+        if let Err(error) = windows_gui::run_webview(&url) {
+            eprintln!("{error}");
+            windows_gui::run_native(state)?;
+        }
+        return Ok(());
+    }
+
     println!("词境精读 Rust 版运行中: {url}");
     if !no_open {
         open_browser(&url);
     }
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let state = Arc::clone(&state);
-                thread::spawn(move || handle_client(stream, state));
-            }
-            Err(error) => eprintln!("连接失败: {error}"),
-        }
-    }
+    serve(listener, state);
     Ok(())
 }
 
@@ -3273,7 +3463,13 @@ fn main() -> Result<(), String> {
 mod windows_gui {
     use super::*;
     use std::ffi::c_void;
+    use std::num::NonZeroIsize;
     use std::ptr::{null, null_mut};
+    use wry::dpi::{PhysicalPosition, PhysicalSize};
+    use wry::raw_window_handle::{
+        HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
+    };
+    use wry::{Rect as WebViewRect, WebView, WebViewBuilder, WebViewExtWindows};
 
     type Bool = i32;
     type Dword = u32;
@@ -3290,6 +3486,9 @@ mod windows_gui {
 
     const CW_USEDEFAULT: i32 = 0x80000000u32 as i32;
     const GWLP_USERDATA: i32 = -21;
+    const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+    const SPI_GETWORKAREA: Uint = 0x0030;
+    const SW_HIDE: i32 = 0;
     const SW_SHOW: i32 = 5;
 
     const WS_OVERLAPPEDWINDOW: Dword = 0x00cf0000;
@@ -3313,7 +3512,10 @@ mod windows_gui {
     const WM_SIZE: Uint = 0x0005;
     const WM_COMMAND: Uint = 0x0111;
     const WM_DESTROY: Uint = 0x0002;
+    const WM_DPICHANGED: Uint = 0x02e0;
     const WM_SETFONT: Uint = 0x0030;
+    const WM_WINDOWPOSCHANGED: Uint = 0x0047;
+    const WM_APP_HOST_RESIZE: Uint = 0x8001;
 
     const EN_CHANGE: usize = 0x0300;
     const CB_ADDSTRING: Uint = 0x0143;
@@ -3328,6 +3530,8 @@ mod windows_gui {
     const MB_ICONWARNING: Uint = 0x0030;
     const MB_ICONERROR: Uint = 0x0010;
     const DEFAULT_GUI_FONT: i32 = 17;
+    const SWP_NOZORDER: Uint = 0x0004;
+    const SWP_NOACTIVATE: Uint = 0x0010;
 
     const ID_DEMO: usize = 1001;
     const ID_CLEAR: usize = 1002;
@@ -3382,6 +3586,14 @@ mod windows_gui {
         ex_style: Dword,
     }
 
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
     #[link(name = "user32")]
     unsafe extern "system" {
         fn RegisterClassW(lp_wnd_class: *const WndClassW) -> u16;
@@ -3402,6 +3614,8 @@ mod windows_gui {
         fn DefWindowProcW(hwnd: Hwnd, msg: Uint, w_param: Wparam, l_param: Lparam) -> Lresult;
         fn DispatchMessageW(lp_msg: *const Msg) -> Lresult;
         fn EnableWindow(hwnd: Hwnd, enable: Bool) -> Bool;
+        fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> Bool;
+        fn GetDpiForWindow(hwnd: Hwnd) -> Uint;
         fn GetDlgItem(hwnd: Hwnd, id: i32) -> Hwnd;
         fn GetMessageW(
             lp_msg: *mut Msg,
@@ -3415,11 +3629,29 @@ mod windows_gui {
         fn LoadCursorW(h_instance: Hinstance, lp_cursor_name: *const u16) -> Hcursor;
         fn MessageBoxW(hwnd: Hwnd, text: *const u16, caption: *const u16, typ: Uint) -> i32;
         fn MoveWindow(hwnd: Hwnd, x: i32, y: i32, width: i32, height: i32, repaint: Bool) -> Bool;
+        fn PostMessageW(hwnd: Hwnd, msg: Uint, w_param: Wparam, l_param: Lparam) -> Bool;
         fn PostQuitMessage(exit_code: i32);
         fn SendMessageW(hwnd: Hwnd, msg: Uint, w_param: Wparam, l_param: Lparam) -> Lresult;
         fn SetWindowLongPtrW(hwnd: Hwnd, n_index: i32, dw_new_long: isize) -> isize;
+        fn SetWindowPos(
+            hwnd: Hwnd,
+            insert_after: Hwnd,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            flags: Uint,
+        ) -> Bool;
         fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> Bool;
+        fn SetProcessDpiAwarenessContext(value: isize) -> Bool;
+        fn SetThreadDpiAwarenessContext(value: isize) -> isize;
         fn ShowWindow(hwnd: Hwnd, cmd_show: i32) -> Bool;
+        fn SystemParametersInfoW(
+            action: Uint,
+            param: Uint,
+            value: *mut c_void,
+            update: Uint,
+        ) -> Bool;
         fn TranslateMessage(lp_msg: *const Msg) -> Bool;
         fn UpdateWindow(hwnd: Hwnd) -> Bool;
     }
@@ -3484,7 +3716,310 @@ mod windows_gui {
         }
     }
 
-    pub fn run(state: Arc<AppState>) -> Result<(), String> {
+    struct WebViewHost(Hwnd);
+
+    impl HasWindowHandle for WebViewHost {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            let hwnd = NonZeroIsize::new(self.0 as isize).ok_or(HandleError::Unavailable)?;
+            let raw = RawWindowHandle::Win32(Win32WindowHandle::new(hwnd));
+            Ok(unsafe { WindowHandle::borrow_raw(raw) })
+        }
+    }
+
+    pub fn enable_high_dpi() {
+        unsafe {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
+
+    fn logical_client_size(hwnd: Hwnd, physical_width: i32, physical_height: i32) -> (i32, i32) {
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i64;
+        let to_logical = |value: i32| ((value.max(1) as i64 * 96 + dpi / 2) / dpi) as i32;
+        (to_logical(physical_width), to_logical(physical_height))
+    }
+
+    unsafe fn initial_window_bounds() -> (i32, i32, i32, i32) {
+        let mut work_area = Rect {
+            left: 0,
+            top: 0,
+            right: 1280,
+            bottom: 800,
+        };
+        let loaded = unsafe {
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut work_area as *mut Rect).cast(), 0)
+        };
+        if loaded == 0 {
+            return (50, 50, 1180, 720);
+        }
+
+        let available_width = (work_area.right - work_area.left).max(640);
+        let available_height = (work_area.bottom - work_area.top).max(480);
+        let horizontal_margin = (available_width / 32).clamp(16, 48);
+        let vertical_margin = (available_height / 32).clamp(16, 36);
+        (
+            work_area.left + horizontal_margin,
+            work_area.top + vertical_margin,
+            (available_width - horizontal_margin * 2).max(640),
+            (available_height - vertical_margin * 2).max(480),
+        )
+    }
+
+    pub fn run_webview(url: &str) -> Result<(), String> {
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            if instance.is_null() {
+                return Err("无法初始化 Windows 窗口。".to_string());
+            }
+
+            let class_name = wide("CijingReaderWebViewWindow");
+            let class = WndClassW {
+                style: 0,
+                lpfn_wnd_proc: Some(webview_window_proc),
+                cb_cls_extra: 0,
+                cb_wnd_extra: 0,
+                h_instance: instance,
+                h_icon: null_mut(),
+                h_cursor: LoadCursorW(null_mut(), 32512usize as *const u16),
+                hbr_background: (16 + 1) as Hbrush,
+                lpsz_menu_name: null(),
+                lpsz_class_name: class_name.as_ptr(),
+            };
+            if RegisterClassW(&class) == 0 {
+                return Err("注册内嵌界面窗口失败。".to_string());
+            }
+
+            let window_title = wide("词境精读");
+            let (window_x, window_y, window_width, window_height) = initial_window_bounds();
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                window_title.as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                window_x,
+                window_y,
+                window_width,
+                window_height,
+                null_mut(),
+                null_mut(),
+                instance,
+                null_mut(),
+            );
+            if hwnd.is_null() {
+                return Err("创建内嵌界面窗口失败。".to_string());
+            }
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+
+            let host = WebViewHost(hwnd);
+            let allowed_origin = url.to_string();
+            let mut client_rect = Rect {
+                left: 0,
+                top: 0,
+                right: window_width,
+                bottom: window_height,
+            };
+            GetClientRect(hwnd, &mut client_rect);
+            let initial_client_width = (client_rect.right - client_rect.left).max(1);
+            let initial_client_height = (client_rect.bottom - client_rect.top).max(1);
+            let (initial_layout_width, initial_layout_height) =
+                logical_client_size(hwnd, initial_client_width, initial_client_height);
+            let initial_bounds = WebViewRect {
+                position: PhysicalPosition::new(0, 0).into(),
+                size: PhysicalSize::new(initial_client_width, initial_client_height).into(),
+            };
+            let responsive_script = format!(
+                r#"
+                window.__CIJING_SET_HOST_SIZE__ = (layoutWidth, layoutHeight) => {{
+                  const width = Math.max(240, layoutWidth);
+                  const height = Math.max(320, layoutHeight);
+                  const apply = () => {{
+                    const root = document.documentElement;
+                    if (!root) {{
+                      requestAnimationFrame(apply);
+                      return;
+                    }}
+                    root.style.setProperty("--host-width", `${{width}}px`);
+                    root.style.setProperty("--host-height", `${{height}}px`);
+                    root.classList.toggle("host-medium", width <= 1100);
+                    root.classList.toggle("host-small", width <= 720);
+                    root.classList.toggle("host-mobile", width <= 480);
+                    root.classList.toggle("host-compact-height", height <= 720 && width > 1100);
+                    window.dispatchEvent(new Event("resize"));
+                  }};
+                  apply();
+                }};
+                document.addEventListener("DOMContentLoaded", () => {{
+                  window.__CIJING_SET_HOST_SIZE__({initial_layout_width}, {initial_layout_height});
+                }}, {{ once: true }});
+                "#
+            );
+            let webview = match WebViewBuilder::new()
+                .with_url(url)
+                .with_bounds(initial_bounds)
+                .with_initialization_script("window.__CIJING_DESKTOP__ = true;")
+                .with_initialization_script(responsive_script)
+                .with_clipboard(true)
+                .with_navigation_handler(move |candidate| {
+                    candidate == "about:blank" || candidate.starts_with(&allowed_origin)
+                })
+                .with_ipc_handler(|request| {
+                    if request.body() == "open-output-folder" {
+                        let output_dir = app_output_dir();
+                        let _ = fs::create_dir_all(&output_dir);
+                        let _ = Command::new("explorer").arg(output_dir).spawn();
+                    }
+                })
+                .build_as_child(&host)
+            {
+                Ok(webview) => webview,
+                Err(error) => {
+                    let detail = format!(
+                        "无法创建内嵌网页界面（需要 WebView2），将改用兼容窗口。\r\n\r\n{error}"
+                    );
+                    MessageBoxW(
+                        hwnd,
+                        wide(&detail).as_ptr(),
+                        window_title.as_ptr(),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                    ShowWindow(hwnd, SW_HIDE);
+                    return Err(detail);
+                }
+            };
+            let webview_ptr = Box::into_raw(Box::new(webview));
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, webview_ptr as isize);
+
+            let mut msg = Msg {
+                hwnd: null_mut(),
+                message: 0,
+                w_param: 0,
+                l_param: 0,
+                time: 0,
+                pt: Point { x: 0, y: 0 },
+            };
+            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        Ok(())
+    }
+
+    fn resize_webview_bounds(webview: &WebView, width: i32, height: i32) {
+        let bounds = WebViewRect {
+            position: PhysicalPosition::new(0, 0).into(),
+            size: PhysicalSize::new(width, height).into(),
+        };
+        if let Err(error) = webview.set_bounds(bounds) {
+            eprintln!("调整内嵌界面尺寸失败：{error}");
+        }
+        if let Err(error) = unsafe { webview.controller().NotifyParentWindowPositionChanged() } {
+            eprintln!("通知 WebView 窗口位置变化失败：{error}");
+        }
+    }
+
+    fn sync_page_host_size(webview: &WebView, width: i32, height: i32) {
+        let script = format!(
+            r#"
+            (() => {{
+              const width = Math.max(240, {width});
+              const height = Math.max(320, {height});
+              const root = document.documentElement;
+              if (!root) return;
+              root.style.setProperty("--host-width", `${{width}}px`);
+              root.style.setProperty("--host-height", `${{height}}px`);
+              root.classList.toggle("host-medium", width <= 1100);
+              root.classList.toggle("host-small", width <= 720);
+              root.classList.toggle("host-mobile", width <= 480);
+              root.classList.toggle("host-compact-height", height <= 720 && width > 1100);
+              window.dispatchEvent(new Event("resize"));
+            }})();
+            "#
+        );
+        if let Err(error) = webview.evaluate_script(&script) {
+            eprintln!("同步页面响应式尺寸失败：{error}");
+        }
+    }
+
+    unsafe extern "system" fn webview_window_proc(
+        hwnd: Hwnd,
+        msg: Uint,
+        w_param: Wparam,
+        l_param: Lparam,
+    ) -> Lresult {
+        match msg {
+            WM_SIZE => {
+                let webview_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WebView };
+                let width = (l_param as u32 & 0xffff) as i32;
+                let height = ((l_param as u32 >> 16) & 0xffff) as i32;
+                if !webview_ptr.is_null() && width > 0 && height > 0 {
+                    let webview = unsafe { &*webview_ptr };
+                    resize_webview_bounds(webview, width, height);
+                    let (layout_width, layout_height) = logical_client_size(hwnd, width, height);
+                    unsafe {
+                        PostMessageW(
+                            hwnd,
+                            WM_APP_HOST_RESIZE,
+                            layout_width as Wparam,
+                            layout_height as Lparam,
+                        )
+                    };
+                }
+                0
+            }
+            WM_APP_HOST_RESIZE => {
+                let webview_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WebView };
+                if !webview_ptr.is_null() {
+                    let webview = unsafe { &*webview_ptr };
+                    sync_page_host_size(webview, w_param as i32, l_param as i32);
+                }
+                0
+            }
+            WM_WINDOWPOSCHANGED => {
+                let webview_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WebView };
+                if !webview_ptr.is_null() {
+                    let webview = unsafe { &*webview_ptr };
+                    if let Err(error) =
+                        unsafe { webview.controller().NotifyParentWindowPositionChanged() }
+                    {
+                        eprintln!("通知 WebView 窗口位置变化失败：{error}");
+                    }
+                }
+                unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) }
+            }
+            WM_DPICHANGED => {
+                let suggested = l_param as *const Rect;
+                if !suggested.is_null() {
+                    let suggested = unsafe { &*suggested };
+                    unsafe {
+                        SetWindowPos(
+                            hwnd,
+                            null_mut(),
+                            suggested.left,
+                            suggested.top,
+                            suggested.right - suggested.left,
+                            suggested.bottom - suggested.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        )
+                    };
+                }
+                0
+            }
+            WM_DESTROY => {
+                let webview_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WebView };
+                if !webview_ptr.is_null() {
+                    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+                    unsafe { drop(Box::from_raw(webview_ptr)) };
+                }
+                unsafe { PostQuitMessage(0) };
+                0
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) },
+        }
+    }
+
+    pub fn run_native(state: Arc<AppState>) -> Result<(), String> {
         unsafe {
             let instance = GetModuleHandleW(null());
             if instance.is_null() {
@@ -4058,5 +4593,135 @@ mod windows_gui {
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    fn state() -> &'static AppState {
+        static STATE: OnceLock<AppState> = OnceLock::new();
+        STATE.get_or_init(|| AppState::load().expect("embedded dictionaries should load"))
+    }
+
+    #[test]
+    fn normalizes_inflections_and_compound_words() {
+        assert!(candidate_lemmas("studies").contains(&"study".to_string()));
+        assert!(candidate_lemmas("running").contains(&"run".to_string()));
+        assert_eq!(normalize_key("  Well–Known! "), "well-known");
+    }
+
+    #[test]
+    fn parses_custom_annotations_and_forced_terms() {
+        let (entries, forced, ignored) =
+            parse_custom_annotations("glittered=ˈɡlɪt.ərd=闪闪发光\n*rose\ngarden\n!beautiful");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].term, "glittered");
+        assert!(entries[0].hard);
+        assert_eq!(forced, vec!["rose", "garden"]);
+        assert_eq!(ignored, vec!["beautiful"]);
+    }
+
+    #[test]
+    fn looks_up_local_dictionary_and_serves_editor_tools() {
+        let (status, payload) = handle_dictionary(state(), r#"{"word":"roses"}"#);
+        assert_eq!(status, 200);
+        assert!(payload.contains("\"found\":true"));
+        assert!(payload.contains("\"term\":\"rose\""));
+
+        let (status, mime, body, _) = route_request(state(), "GET", "/editor-tools.js", "");
+        assert_eq!(status, 200);
+        assert_eq!(mime, "text/javascript; charset=utf-8");
+        assert!(body.starts_with(b"(() =>"));
+    }
+
+    #[test]
+    fn clamps_layout_settings_and_converts_page_sizes() {
+        let sizes = text_sizes_from_json(
+            r#"{"englishHps":100,"ipaHps":2,"lineHeight":9,"pageSize":"custom","customPageWidth":210,"customPageHeight":297}"#,
+        );
+        assert_eq!(sizes.english_hps, 48);
+        assert_eq!(sizes.ipa_hps, 8);
+        assert_eq!(sizes.line_height, 3.2);
+        assert_eq!(page_size_twips(sizes.page_size), (11906, 16838));
+    }
+
+    #[test]
+    fn builds_valid_docx_package_with_requested_page_size() {
+        let sizes = TextSizes {
+            page_size: PageSize {
+                width: 210.0,
+                height: 297.0,
+                unit: "mm",
+            },
+            ..TextSizes::default_body()
+        };
+        let bytes = build_docx(&["<w:p/>".to_string()], sizes).expect("DOCX should build");
+        assert!(bytes.starts_with(b"PK\x03\x04"));
+        let package_text = String::from_utf8_lossy(&bytes);
+        assert!(package_text.contains("word/document.xml"));
+        assert!(package_text.contains("w:pgSz w:w=\"11906\" w:h=\"16838\""));
+    }
+
+    #[test]
+    fn renders_safe_preview_and_generates_annotated_docx() {
+        let (preview, _) = render_preview_html(
+            state(),
+            "The glittered rose <script>alert('x')</script>.",
+            "Reading Test",
+            "glittered=ˈɡlɪt.ərd=闪闪发光",
+            true,
+            "P4",
+        )
+        .expect("preview should render");
+        assert!(preview.contains("preview-page"));
+        assert!(preview.contains("preview-token"));
+        assert!(!preview.contains("<script>"));
+        assert!(preview.contains("&lt;"));
+
+        let output = std::env::temp_dir().join(format!("cijing-test-{}.docx", unique_suffix()));
+        let result = generate_docx(
+            state(),
+            DEMO_TEXT,
+            &output,
+            "Lesson 37 The Tea Rose",
+            "glittered=ˈɡlɪt.ərd=闪闪发光",
+            true,
+            "P4",
+            TextSizes::default_body(),
+        );
+        assert!(result.is_ok());
+        let metadata = fs::metadata(&output).expect("generated DOCX should exist");
+        assert!(metadata.len() > 1_000);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn serves_only_expected_download_types() {
+        assert_eq!(download_mime("article.pdf"), "application/pdf");
+        assert_eq!(
+            download_mime("article.docx"),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn opens_embedded_ui_by_default_on_windows() {
+        assert!(should_use_embedded_ui(&["词境精读.exe".to_string()]));
+        assert!(!should_use_embedded_ui(&[
+            "词境精读.exe".to_string(),
+            "--browser".to_string(),
+        ]));
+        assert!(!should_use_embedded_ui(&[
+            "词境精读.exe".to_string(),
+            "--native".to_string(),
+        ]));
+        assert!(!should_use_embedded_ui(&[
+            "词境精读.exe".to_string(),
+            "--no-open".to_string(),
+        ]));
     }
 }
