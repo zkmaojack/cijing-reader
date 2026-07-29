@@ -6,15 +6,20 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INDEX_HTML: &str = include_str!("../assets/web/index.html");
+const UI_LANGUAGE_PACKS_JS: &str = include_str!("../assets/web/ui-language-packs.js");
+const I18N_JS: &str = include_str!("../assets/web/i18n.js");
 const APP_JS: &str = include_str!("../assets/web/app.js");
 const EDITOR_TOOLS_JS: &str = include_str!("../assets/web/editor-tools.js");
 const STYLES_CSS: &str = include_str!("../assets/web/styles.css");
+const BRAND_LOGO_PNG: &[u8] = include_bytes!("../assets/brand/yujie-logo-64.png");
+#[cfg(target_os = "windows")]
+const BRAND_ICON_ICO: &[u8] = include_bytes!("../assets/brand/yujie-logo.ico");
 const PROFILES_TSV: &str = include_str!("../assets/data/profiles.tsv");
 const TIERS_TSV: &str = include_str!("../assets/data/tiers.tsv");
 const BASIC_WORDS: &str = include_str!("../assets/data/basic_words.txt");
@@ -26,6 +31,39 @@ const CMUDICT: &[u8] = include_bytes!("../assets/data/cmudict.dict");
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
+const REMOTE_TRANSLATION_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+fn background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+fn spawn_background_powershell(args: &[String]) -> std::io::Result<std::process::Child> {
+    let mut last_not_found = None;
+    for program in ["powershell.exe", "pwsh.exe", "pwsh"] {
+        match background_command(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_not_found = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_not_found.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "PowerShell is not installed")
+    }))
+}
 
 #[derive(Clone, Debug)]
 struct GradeProfile {
@@ -46,19 +84,6 @@ struct LexiconEntry {
 }
 
 impl LexiconEntry {
-    fn ipa_text(&self) -> String {
-        let ipa = if self.ipa.trim().is_empty() {
-            "?"
-        } else {
-            self.ipa.trim()
-        };
-        if ipa.starts_with('(') && ipa.ends_with(')') {
-            ipa.to_string()
-        } else {
-            format!("({ipa})")
-        }
-    }
-
     fn zh_text(&self) -> String {
         compact_translation(&self.zh, 10)
     }
@@ -71,6 +96,13 @@ struct AppState {
     seed_lexicon: HashMap<String, LexiconEntry>,
     translations: HashMap<String, String>,
     pronunciations: HashMap<String, Vec<Vec<String>>>,
+    remote_translation: Mutex<RemoteTranslationState>,
+}
+
+#[derive(Default)]
+struct RemoteTranslationState {
+    cooldown_until: Option<Instant>,
+    in_flight: bool,
 }
 
 impl AppState {
@@ -121,6 +153,7 @@ impl AppState {
             seed_lexicon,
             translations: load_translations()?,
             pronunciations: load_pronunciations()?,
+            remote_translation: Mutex::new(RemoteTranslationState::default()),
         })
     }
 
@@ -134,6 +167,127 @@ impl AppState {
                     .find(|profile| profile.code == "P4")
                     .unwrap()
             })
+    }
+}
+
+fn target_language_name(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "zh-Hans" => "简体中文",
+        "zh-Hant" => "繁体中文",
+        "en" => "英语",
+        "ja" => "日语",
+        "ko" => "韩语",
+        "es" => "西班牙语",
+        "fr" => "法语",
+        "de" => "德语",
+        "pt-BR" => "巴西葡萄牙语",
+        "pt-PT" => "欧洲葡萄牙语",
+        "ru" => "俄语",
+        "ar" => "阿拉伯语",
+        "hi" => "印地语",
+        "vi" => "越南语",
+        "th" => "泰语",
+        "id" => "印度尼西亚语",
+        "ms" => "马来语",
+        "fil" => "菲律宾语",
+        "my" => "缅甸语",
+        "km" => "高棉语",
+        "lo" => "老挝语",
+        "mn" => "蒙古语",
+        "mi" => "毛利语",
+        "jv" => "爪哇语",
+        "su" => "巽他语",
+        "ceb" => "宿务语",
+        "bo" => "藏语",
+        "ug" => "维吾尔语",
+        "bn" => "孟加拉语",
+        "ur" => "乌尔都语",
+        "pa" => "旁遮普语",
+        "ta" => "泰米尔语",
+        "te" => "泰卢固语",
+        "mr" => "马拉地语",
+        "gu" => "古吉拉特语",
+        "kn" => "卡纳达语",
+        "ml" => "马拉雅拉姆语",
+        "ne" => "尼泊尔语",
+        "si" => "僧伽罗语",
+        "uz" => "乌兹别克语",
+        "kk" => "哈萨克语",
+        "ps" => "普什图语",
+        "sd" => "信德语",
+        "ky" => "吉尔吉斯语",
+        "tg" => "塔吉克语",
+        "tk" => "土库曼语",
+        "it" => "意大利语",
+        "nl" => "荷兰语",
+        "pl" => "波兰语",
+        "tr" => "土耳其语",
+        "uk" => "乌克兰语",
+        "cs" => "捷克语",
+        "ro" => "罗马尼亚语",
+        "hu" => "匈牙利语",
+        "el" => "希腊语",
+        "sv" => "瑞典语",
+        "da" => "丹麦语",
+        "no" => "挪威语",
+        "fi" => "芬兰语",
+        "sk" => "斯洛伐克语",
+        "sl" => "斯洛文尼亚语",
+        "hr" => "克罗地亚语",
+        "sr" => "塞尔维亚语",
+        "bg" => "保加利亚语",
+        "lt" => "立陶宛语",
+        "lv" => "拉脱维亚语",
+        "et" => "爱沙尼亚语",
+        "ca" => "加泰罗尼亚语",
+        "eu" => "巴斯克语",
+        "gl" => "加利西亚语",
+        "ga" => "爱尔兰语",
+        "cy" => "威尔士语",
+        "is" => "冰岛语",
+        "sq" => "阿尔巴尼亚语",
+        "mk" => "马其顿语",
+        "be" => "白俄罗斯语",
+        "mt" => "马耳他语",
+        "lb" => "卢森堡语",
+        "fa" => "波斯语",
+        "he" => "希伯来语",
+        "hy" => "亚美尼亚语",
+        "ka" => "格鲁吉亚语",
+        "az" => "阿塞拜疆语",
+        "ku" => "库尔德语",
+        "ht" => "海地克里奥尔语",
+        "sw" => "斯瓦希里语",
+        "af" => "南非语",
+        "am" => "阿姆哈拉语",
+        "so" => "索马里语",
+        "ha" => "豪萨语",
+        "yo" => "约鲁巴语",
+        "zu" => "祖鲁语",
+        "ig" => "伊博语",
+        "om" => "奥罗莫语",
+        "xh" => "科萨语",
+        "rw" => "卢旺达语",
+        "mg" => "马达加斯加语",
+        "ny" => "齐切瓦语",
+        _ => return None,
+    })
+}
+
+fn target_language(body: &str) -> String {
+    let code = json_string(body, "targetLanguage").unwrap_or_else(|| "zh-Hans".to_string());
+    if target_language_name(&code).is_some() {
+        code
+    } else {
+        "zh-Hans".to_string()
+    }
+}
+
+fn pronunciation_scheme(body: &str) -> String {
+    let scheme = json_string(body, "pronunciationScheme").unwrap_or_else(|| "ipa-us".to_string());
+    match scheme.as_str() {
+        "ipa-us" | "ipa-uk" | "ipa" | "target-friendly" | "syllable" | "none" => scheme,
+        _ => "ipa-us".to_string(),
     }
 }
 
@@ -206,7 +360,10 @@ fn load_pronunciations() -> Result<HashMap<String, Vec<Vec<String>>>, String> {
         if let Some(index) = word.find('(') {
             word.truncate(index);
         }
-        let phones: Vec<String> = parts.map(ToOwned::to_owned).collect();
+        let phones: Vec<String> = parts
+            .take_while(|phone| !phone.starts_with('#'))
+            .map(ToOwned::to_owned)
+            .collect();
         if !word.is_empty() && !phones.is_empty() {
             map.entry(word).or_default().push(phones);
         }
@@ -384,7 +541,7 @@ fn parse_custom_annotations(custom_text: &str) -> (Vec<LexiconEntry>, Vec<String
                 break;
             }
         }
-        if parts.len() >= 3 && parts.iter().all(|part| !part.is_empty()) {
+        if parts.len() >= 3 && !parts[0].is_empty() && !parts[2].is_empty() {
             entries.push(LexiconEntry {
                 term: parts[0].clone(),
                 ipa: parts[1].clone(),
@@ -438,14 +595,34 @@ fn lookup_entry(
     state: &AppState,
     word: &str,
     lexicon: &mut HashMap<String, LexiconEntry>,
+    use_offline_translation: bool,
+    use_pronunciation: bool,
 ) -> Option<LexiconEntry> {
     for candidate in candidate_lemmas(word) {
         if let Some(entry) = lexicon.get(&candidate) {
-            return Some(entry.clone());
+            let mut resolved = entry.clone();
+            if use_pronunciation && resolved.ipa.trim().is_empty() {
+                resolved.ipa = lookup_generated_ipa(state, word).unwrap_or_default();
+            }
+            if use_offline_translation && resolved.zh.trim().is_empty() {
+                resolved.zh = lookup_generated_translation(state, word).unwrap_or_default();
+            }
+            return Some(resolved);
         }
     }
-    let generated_ipa = lookup_generated_ipa(state, word)?;
-    let translation = lookup_generated_translation(state, word)?;
+    let generated_ipa = if use_pronunciation {
+        lookup_generated_ipa(state, word).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let translation = if use_offline_translation {
+        lookup_generated_translation(state, word).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if generated_ipa.is_empty() && translation.is_empty() {
+        return None;
+    }
     let entry = LexiconEntry {
         term: word.to_string(),
         ipa: generated_ipa,
@@ -573,6 +750,187 @@ fn split_arpabet_stress(phoneme: &str) -> (&str, Option<char>) {
     (phoneme, None)
 }
 
+fn normalize_pronunciation_source(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches(['(', '[', '/'])
+        .trim_end_matches([')', ']', '/'])
+        .trim()
+        .to_string()
+}
+
+fn british_ipa_approximation(source: &str) -> String {
+    let normalized = source
+        .replace("ɝ", "ɜː")
+        .replace("ɚ", "ə")
+        .replace("oʊ", "əʊ");
+    let chars: Vec<char> = normalized.chars().collect();
+    let mut out = String::new();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch == 'ɛ' {
+            out.push('e');
+            continue;
+        }
+        out.push(ch);
+        if matches!(ch, 'ɑ' | 'u' | 'i') && chars.get(index + 1) != Some(&'ː') {
+            out.push('ː');
+        }
+    }
+    out
+}
+
+fn generic_ipa(source: &str) -> String {
+    source.replace("ɝ", "ɜr").replace("ɚ", "ər")
+}
+
+fn readable_respelling(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let pair = if index + 1 < chars.len() {
+            Some((chars[index], chars[index + 1]))
+        } else {
+            None
+        };
+        let paired = match pair {
+            Some(('t', 'ʃ')) => Some("ch"),
+            Some(('d', 'ʒ')) => Some("j"),
+            Some(('a', 'ʊ')) => Some("ow"),
+            Some(('a', 'ɪ')) => Some("eye"),
+            Some(('e', 'ɪ')) => Some("ay"),
+            Some(('o', 'ʊ')) => Some("oh"),
+            Some(('ɔ', 'ɪ')) => Some("oy"),
+            _ => None,
+        };
+        if let Some(value) = paired {
+            out.push_str(value);
+            index += 2;
+            continue;
+        }
+        match chars[index] {
+            'ɝ' => out.push_str("ur"),
+            'ɚ' => out.push_str("er"),
+            'ɑ' => out.push_str("ah"),
+            'æ' => out.push('a'),
+            'ɔ' => out.push_str("aw"),
+            'ɛ' => out.push_str("eh"),
+            'ɪ' => out.push_str("ih"),
+            'i' => out.push_str("ee"),
+            'ʊ' => out.push('u'),
+            'u' => out.push_str("oo"),
+            'ʌ' | 'ə' => out.push_str("uh"),
+            'θ' | 'ð' => out.push_str("th"),
+            'ʃ' => out.push_str("sh"),
+            'ʒ' => out.push_str("zh"),
+            'ŋ' => out.push_str("ng"),
+            'ɡ' => out.push('g'),
+            'j' => out.push('y'),
+            'ˈ' => out.push('\''),
+            'ˌ' => out.push(','),
+            '.' | '·' => out.push('-'),
+            other => out.push(other),
+        }
+        index += 1;
+    }
+    out
+}
+
+fn syllable_pronunciation(source: &str) -> String {
+    let mut chars = Vec::new();
+    let mut boundaries = HashSet::new();
+    for ch in source.chars() {
+        if matches!(ch, '.' | '·') {
+            boundaries.insert(chars.len());
+        } else {
+            chars.push(ch);
+        }
+    }
+
+    let is_vowel = |ch: char| {
+        matches!(
+            ch,
+            'a' | 'e'
+                | 'i'
+                | 'o'
+                | 'u'
+                | 'ɑ'
+                | 'æ'
+                | 'ɔ'
+                | 'ɛ'
+                | 'ɪ'
+                | 'ʊ'
+                | 'ʌ'
+                | 'ə'
+                | 'ɚ'
+                | 'ɝ'
+                | 'ɜ'
+        )
+    };
+    let is_diphthong = |first: char, second: char| {
+        matches!(
+            (first, second),
+            ('a', 'ʊ') | ('a', 'ɪ') | ('e', 'ɪ') | ('o', 'ʊ') | ('ɔ', 'ɪ')
+        )
+    };
+    let mut vowel_spans = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if is_vowel(chars[index]) {
+            let end = if index + 1 < chars.len() && is_diphthong(chars[index], chars[index + 1]) {
+                index + 1
+            } else {
+                index
+            };
+            vowel_spans.push((index, end));
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+
+    for pair in vowel_spans.windows(2) {
+        let (_, previous_end) = pair[0];
+        let (next_start, _) = pair[1];
+        let mut between = (previous_end + 1)..next_start;
+        let stress_boundary = between
+            .clone()
+            .find(|position| matches!(chars[*position], 'ˈ' | 'ˌ'));
+        let consonant_boundary = between.rfind(|position| !matches!(chars[*position], 'ˈ' | 'ˌ'));
+        boundaries.insert(stress_boundary.or(consonant_boundary).unwrap_or(next_start));
+    }
+
+    let mut out = String::new();
+    for (index, ch) in chars.into_iter().enumerate() {
+        if boundaries.contains(&index) && !out.is_empty() && !out.ends_with('·') {
+            out.push('·');
+        }
+        out.push(ch);
+    }
+    out.trim_matches('·').to_string()
+}
+
+fn format_pronunciation(raw: &str, scheme: &str) -> String {
+    if scheme == "none" {
+        return String::new();
+    }
+    let source = normalize_pronunciation_source(raw);
+    if source.is_empty() {
+        return String::new();
+    }
+    let formatted = match scheme {
+        "ipa-uk" => british_ipa_approximation(&source),
+        "ipa" => generic_ipa(&source),
+        "target-friendly" => readable_respelling(&source),
+        "syllable" => syllable_pronunciation(&source),
+        _ => source,
+    };
+    if formatted.is_empty() {
+        String::new()
+    } else {
+        format!("({formatted})")
+    }
+}
+
 fn lookup_generated_translation(state: &AppState, word: &str) -> Option<String> {
     let mut exact_translation = None;
     let mut first_compact = None;
@@ -627,9 +985,24 @@ fn compact_translation(text: &str, max_length: usize) -> String {
     }
     value = remove_bracketed(&value, '[', ']');
     value = remove_inflection_parentheses(&value);
+    let contains_cjk = value.chars().any(is_cjk);
 
     for raw_clause in value.split(['\n', ';', '；', '。']) {
         let mut clause = strip_pos_prefix(raw_clause.trim()).to_string();
+        if clause.is_empty() {
+            continue;
+        }
+        if !contains_cjk {
+            clause = clause
+                .trim_matches(|ch: char| ch.is_whitespace() || " ,，、:：".contains(ch))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !clause.is_empty() {
+                return take_chars(&clause, max_length.max(48));
+            }
+            continue;
+        }
         if !clause.chars().any(is_cjk) {
             continue;
         }
@@ -955,12 +1328,14 @@ fn generate_docx(
     custom_annotations: &str,
     annotate_unknown: bool,
     grade_code: &str,
+    target_language: &str,
+    pronunciation_scheme: &str,
     sizes: TextSizes,
 ) -> Result<Vec<String>, String> {
     let article_text = prepare_article_text(article_text, title)?;
     let title = title.trim();
     let (mut lexicon, hard_terms, profile, known_words) =
-        annotation_context(state, custom_annotations, grade_code)?;
+        annotation_context(state, custom_annotations, grade_code, target_language)?;
 
     let mut missing_terms = HashSet::new();
     let mut paragraphs = Vec::new();
@@ -974,6 +1349,8 @@ fn generate_docx(
             &known_words,
             annotate_unknown,
             &mut missing_terms,
+            target_language == "zh-Hans",
+            pronunciation_scheme,
         );
         paragraphs.push(items_to_docx_paragraph(
             &items,
@@ -999,6 +1376,8 @@ fn generate_docx(
             &known_words,
             annotate_unknown,
             &mut missing_terms,
+            target_language == "zh-Hans",
+            pronunciation_scheme,
         );
         paragraphs.push(items_to_docx_paragraph(
             &items,
@@ -1024,18 +1403,29 @@ fn generate_docx(
     Ok(sorted_missing(missing_terms))
 }
 
+#[derive(Clone, Copy)]
+struct PreviewOptions<'a> {
+    title: &'a str,
+    custom_annotations: &'a str,
+    annotate_unknown: bool,
+    grade_code: &'a str,
+    target_language: &'a str,
+    pronunciation_scheme: &'a str,
+}
+
 fn render_preview_html(
     state: &AppState,
     article_text: &str,
-    title: &str,
-    custom_annotations: &str,
-    annotate_unknown: bool,
-    grade_code: &str,
+    options: PreviewOptions<'_>,
 ) -> Result<(String, Vec<String>), String> {
-    let article_text = prepare_article_text(article_text, title)?;
-    let title = title.trim();
-    let (mut lexicon, hard_terms, profile, known_words) =
-        annotation_context(state, custom_annotations, grade_code)?;
+    let article_text = prepare_article_text(article_text, options.title)?;
+    let title = options.title.trim();
+    let (mut lexicon, hard_terms, profile, known_words) = annotation_context(
+        state,
+        options.custom_annotations,
+        options.grade_code,
+        options.target_language,
+    )?;
     let mut missing_terms = HashSet::new();
     let mut html = String::from("<div class=\"preview-page\">");
 
@@ -1047,8 +1437,10 @@ fn render_preview_html(
             &hard_terms,
             profile,
             &known_words,
-            annotate_unknown,
+            options.annotate_unknown,
             &mut missing_terms,
+            options.target_language == "zh-Hans",
+            options.pronunciation_scheme,
         );
         html.push_str("<p class=\"preview-line preview-title\">");
         html.push_str(&items_to_preview_html(&items));
@@ -1068,8 +1460,10 @@ fn render_preview_html(
             &hard_terms,
             profile,
             &known_words,
-            annotate_unknown,
+            options.annotate_unknown,
             &mut missing_terms,
+            options.target_language == "zh-Hans",
+            options.pronunciation_scheme,
         );
         html.push_str("<p class=\"preview-line\">");
         html.push_str(&items_to_preview_html(&items));
@@ -1089,15 +1483,21 @@ fn generate_pdf(
     custom_annotations: &str,
     annotate_unknown: bool,
     grade_code: &str,
+    target_language: &str,
+    pronunciation_scheme: &str,
     sizes: TextSizes,
 ) -> Result<Vec<String>, String> {
     let (preview_html, missing) = render_preview_html(
         state,
         article_text,
-        title,
-        custom_annotations,
-        annotate_unknown,
-        grade_code,
+        PreviewOptions {
+            title,
+            custom_annotations,
+            annotate_unknown,
+            grade_code,
+            target_language,
+            pronunciation_scheme,
+        },
     )?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -1128,7 +1528,7 @@ fn printable_preview_html(preview_html: &str, sizes: TextSizes) -> String {
     format!(
         concat!(
             "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"/>",
-            "<title>词境精读 PDF</title><style>",
+            "<title>语界精读 PDF</title><style>",
             "@page{{size:{page_width} {page_height};margin:0;}}",
             "html,body{{width:{page_width};min-height:{page_height};margin:0;padding:0;background:white;color:#111827;}}",
             ".preview-page{{width:{page_width};min-height:{page_height};padding:0.82in;box-sizing:border-box;background:white;",
@@ -1223,7 +1623,7 @@ fn run_pdf_browser_attempt(
 ) -> Result<(), String> {
     let output_arg = format!("--print-to-pdf={}", output_path.display());
     let profile_arg = format!("--user-data-dir={}", profile_dir.display());
-    let mut child = Command::new(browser)
+    let mut child = background_command(browser)
         .args([
             headless_arg,
             "--disable-gpu",
@@ -1328,7 +1728,7 @@ fn find_pdf_browser() -> Option<PathBuf> {
         }
     }
     for name in ["msedge", "chrome", "google-chrome", "chromium"] {
-        if Command::new(name).arg("--version").output().is_ok() {
+        if background_command(name).arg("--version").output().is_ok() {
             return Some(PathBuf::from(name));
         }
     }
@@ -1388,8 +1788,14 @@ fn annotation_context<'a>(
     state: &'a AppState,
     custom_annotations: &str,
     grade_code: &str,
+    target_language: &str,
 ) -> Result<AnnotationContext<'a>, String> {
     let mut lexicon = state.seed_lexicon.clone();
+    if target_language != "zh-Hans" {
+        for entry in lexicon.values_mut() {
+            entry.zh.clear();
+        }
+    }
     let (custom_entries, custom_force_terms, ignored_terms) =
         parse_custom_annotations(custom_annotations);
     for entry in custom_entries {
@@ -1547,6 +1953,8 @@ fn annotate_items(
     known_words: &HashSet<String>,
     annotate_unknown: bool,
     missing_terms: &mut HashSet<String>,
+    use_offline_translation: bool,
+    pronunciation_scheme: &str,
 ) -> Vec<AnnotationItem> {
     let mut items = Vec::new();
     for token in tokenize(text) {
@@ -1557,7 +1965,13 @@ fn annotate_items(
             });
             continue;
         }
-        let entry = lookup_entry(state, &token, lexicon);
+        let entry = lookup_entry(
+            state,
+            &token,
+            lexicon,
+            use_offline_translation,
+            pronunciation_scheme != "none",
+        );
         let force = should_annotate_word(
             state,
             &token,
@@ -1587,7 +2001,7 @@ fn annotate_items(
             });
             continue;
         };
-        let ipa = entry.ipa_text();
+        let ipa = format_pronunciation(&entry.ipa, pronunciation_scheme);
         let zh = entry.zh_text();
         if ipa.is_empty() && zh.is_empty() {
             if annotate_unknown {
@@ -2354,6 +2768,8 @@ fn profiles_json(state: &AppState) -> String {
 
 fn handle_dictionary(state: &AppState, body: &str) -> (u16, String) {
     let word = json_string(body, "word").unwrap_or_default();
+    let target_language = target_language(body);
+    let pronunciation_scheme = pronunciation_scheme(body);
     let word = word.trim();
     if word.is_empty() || word.len() > 120 {
         return (400, "{\"error\":\"请输入需要查询的英文单词\"}".to_string());
@@ -2367,8 +2783,21 @@ fn handle_dictionary(state: &AppState, body: &str) -> (u16, String) {
         }
     }
     let mut lexicon = state.seed_lexicon.clone();
-    let entry = lookup_entry(state, word, &mut lexicon);
+    if target_language != "zh-Hans" {
+        for entry in lexicon.values_mut() {
+            entry.zh.clear();
+        }
+    }
+    let entry = lookup_entry(
+        state,
+        word,
+        &mut lexicon,
+        target_language == "zh-Hans",
+        true,
+    );
     if let Some(entry) = entry {
+        let formatted_ipa = format_pronunciation(&entry.ipa, &pronunciation_scheme);
+        let formatted_ipa = normalize_pronunciation_source(&formatted_ipa);
         if seen.insert(entry.term.clone()) {
             forms.insert(0, entry.term.clone());
         }
@@ -2383,7 +2812,7 @@ fn handle_dictionary(state: &AppState, body: &str) -> (u16, String) {
                 "{{\"ok\":true,\"found\":true,\"word\":\"{}\",\"term\":\"{}\",\"ipa\":\"{}\",\"definition\":\"{}\",\"forms\":[{}]}}",
                 json_escape(word),
                 json_escape(&entry.term),
-                json_escape(&entry.ipa),
+                json_escape(&formatted_ipa),
                 json_escape(&entry.zh),
                 forms_json
             ),
@@ -2411,6 +2840,8 @@ fn handle_preview(state: &AppState, body: &str) -> (u16, String) {
     let grade = json_string(body, "grade").unwrap_or_else(|| "P4".to_string());
     let custom_words = json_string(body, "customWords").unwrap_or_default();
     let annotate_unknown = json_bool(body, "annotateUnknown").unwrap_or(true);
+    let target_language = target_language(body);
+    let pronunciation_scheme = pronunciation_scheme(body);
     if article.trim().is_empty() {
         return (400, "{\"error\":\"请先粘贴英文文章。\"}".to_string());
     }
@@ -2418,10 +2849,14 @@ fn handle_preview(state: &AppState, body: &str) -> (u16, String) {
     match render_preview_html(
         state,
         &article,
-        &title,
-        &custom_words,
-        annotate_unknown,
-        &grade,
+        PreviewOptions {
+            title: &title,
+            custom_annotations: &custom_words,
+            annotate_unknown,
+            grade_code: &grade,
+            target_language: &target_language,
+            pronunciation_scheme: &pronunciation_scheme,
+        },
     ) {
         Ok((html, missing)) => (
             200,
@@ -2435,73 +2870,54 @@ fn handle_preview(state: &AppState, body: &str) -> (u16, String) {
     }
 }
 
-fn handle_ai_enhance(body: &str) -> (u16, String) {
-    let article = json_string(body, "article").unwrap_or_default();
-    let grade = json_string(body, "grade").unwrap_or_else(|| "P4".to_string());
-    let endpoint = json_string(body, "endpoint").unwrap_or_default();
-    let model = json_string(body, "model").unwrap_or_default();
-    let api_key = json_string(body, "apiKey").unwrap_or_default();
-    if article.trim().is_empty() {
-        return (400, "{\"error\":\"请先粘贴英文文章。\"}".to_string());
-    }
-    if endpoint.trim().is_empty() || model.trim().is_empty() {
-        return (400, "{\"error\":\"请填写接口地址和模型。\"}".to_string());
-    }
-
-    match call_ai_annotations(&endpoint, &model, &api_key, &grade, &article) {
-        Ok(annotations) if !annotations.trim().is_empty() => (
-            200,
-            format!(
-                "{{\"ok\":true,\"annotations\":\"{}\"}}",
-                json_escape(&annotations)
-            ),
-        ),
-        Ok(_) => (400, "{\"error\":\"AI 未返回可用标注。\"}".to_string()),
-        Err(error) => (400, format!("{{\"error\":\"{}\"}}", json_escape(&error))),
-    }
-}
-
-fn handle_network_lexicon(state: &AppState, body: &str) -> (u16, String) {
+fn handle_builtin_translate(state: &AppState, body: &str) -> (u16, String) {
     let article = json_string(body, "article").unwrap_or_default();
     let grade = json_string(body, "grade").unwrap_or_else(|| "P4".to_string());
     let custom_words = json_string(body, "customWords").unwrap_or_default();
-    let endpoint = json_string(body, "endpoint").unwrap_or_default();
-    let api_key = json_string(body, "apiKey").unwrap_or_default();
+    let target_language = target_language(body);
     if article.trim().is_empty() {
         return (400, "{\"error\":\"请先粘贴英文文章。\"}".to_string());
     }
-    if endpoint.trim().is_empty() {
-        return (400, "{\"error\":\"请填写网络词库接口。\"}".to_string());
+    if matches!(target_language.as_str(), "zh-Hans") {
+        return (
+            200,
+            "{\"ok\":true,\"annotations\":\"\",\"count\":0,\"fallback\":false,\"warning\":\"\",\"reason\":\"\",\"actualLanguage\":\"zh-Hans\",\"retryAfterMs\":0}"
+                .to_string(),
+        );
     }
-
-    let words = match network_lexicon_candidates(state, &article, &custom_words, &grade) {
+    let words = match builtin_translation_candidates(state, &article, &custom_words, &grade) {
         Ok(words) => words,
         Err(error) => return (400, format!("{{\"error\":\"{}\"}}", json_escape(&error))),
     };
     if words.is_empty() {
         return (
             200,
-            "{\"ok\":true,\"annotations\":\"\",\"count\":0}".to_string(),
+            format!(
+                "{{\"ok\":true,\"annotations\":\"\",\"count\":0,\"fallback\":false,\"warning\":\"\",\"reason\":\"\",\"actualLanguage\":\"{}\",\"retryAfterMs\":0}}",
+                json_escape(&target_language)
+            ),
         );
     }
 
-    match call_network_lexicon(&endpoint, &api_key, &words) {
-        Ok(annotations) => {
-            let count = annotations
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
-            (
-                200,
-                format!(
-                    "{{\"ok\":true,\"annotations\":\"{}\",\"count\":{}}}",
-                    json_escape(&annotations),
-                    count
-                ),
-            )
-        }
-        Err(error) => (400, format!("{{\"error\":\"{}\"}}", json_escape(&error))),
-    }
+    let outcome = call_builtin_translation(state, &target_language, &words);
+    let count = outcome
+        .annotations
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    (
+        200,
+        format!(
+            "{{\"ok\":true,\"annotations\":\"{}\",\"count\":{},\"fallback\":{},\"warning\":\"{}\",\"reason\":\"{}\",\"actualLanguage\":\"{}\",\"retryAfterMs\":{}}}",
+            json_escape(&outcome.annotations),
+            count,
+            outcome.fallback,
+            json_escape(outcome.warning),
+            json_escape(outcome.reason),
+            json_escape(&outcome.actual_language),
+            outcome.retry_after_ms
+        ),
+    )
 }
 
 fn handle_generate_pdf(state: &AppState, body: &str) -> (u16, String) {
@@ -2510,6 +2926,8 @@ fn handle_generate_pdf(state: &AppState, body: &str) -> (u16, String) {
     let grade = json_string(body, "grade").unwrap_or_else(|| "P4".to_string());
     let custom_words = json_string(body, "customWords").unwrap_or_default();
     let annotate_unknown = json_bool(body, "annotateUnknown").unwrap_or(true);
+    let target_language = target_language(body);
+    let pronunciation_scheme = pronunciation_scheme(body);
     let sizes = text_sizes_from_json(body);
     if article.trim().is_empty() {
         return (400, "{\"error\":\"请先粘贴英文文章。\"}".to_string());
@@ -2533,6 +2951,8 @@ fn handle_generate_pdf(state: &AppState, body: &str) -> (u16, String) {
         &custom_words,
         annotate_unknown,
         &grade,
+        &target_language,
+        &pronunciation_scheme,
         sizes,
     ) {
         Ok(missing) => {
@@ -2557,6 +2977,8 @@ fn handle_generate_docx(state: &AppState, body: &str) -> (u16, String) {
     let grade = json_string(body, "grade").unwrap_or_else(|| "P4".to_string());
     let custom_words = json_string(body, "customWords").unwrap_or_default();
     let annotate_unknown = json_bool(body, "annotateUnknown").unwrap_or(true);
+    let target_language = target_language(body);
+    let pronunciation_scheme = pronunciation_scheme(body);
     let sizes = text_sizes_from_json(body);
     if article.trim().is_empty() {
         return (400, "{\"error\":\"请先粘贴英文文章。\"}".to_string());
@@ -2580,6 +3002,8 @@ fn handle_generate_docx(state: &AppState, body: &str) -> (u16, String) {
         &custom_words,
         annotate_unknown,
         &grade,
+        &target_language,
+        &pronunciation_scheme,
         sizes,
     ) {
         Ok(missing) => {
@@ -2598,14 +3022,19 @@ fn handle_generate_docx(state: &AppState, body: &str) -> (u16, String) {
     }
 }
 
-fn network_lexicon_candidates(
+fn builtin_translation_candidates(
     state: &AppState,
     article: &str,
     custom_words: &str,
     grade: &str,
 ) -> Result<Vec<String>, String> {
+    let (custom_entries, _, _) = parse_custom_annotations(custom_words);
+    let manual_terms: HashSet<String> = custom_entries
+        .iter()
+        .flat_map(|entry| key_variants(&entry.term))
+        .collect();
     let (mut lexicon, hard_terms, profile, known_words) =
-        annotation_context(state, custom_words, grade)?;
+        annotation_context(state, custom_words, grade, "zh-Hans")?;
     let mut seen = HashSet::new();
     let mut words = Vec::new();
     for token in tokenize(article) {
@@ -2616,8 +3045,11 @@ fn network_lexicon_candidates(
         if key.len() < 3 || seen.contains(&key) {
             continue;
         }
-        let entry = lookup_entry(state, &token, &mut lexicon);
-        if entry.as_ref().is_some_and(|entry| entry.hard) {
+        let entry = lookup_entry(state, &token, &mut lexicon, true, true);
+        if candidate_lemmas(&token)
+            .iter()
+            .any(|candidate| manual_terms.contains(candidate))
+        {
             continue;
         }
         if should_annotate_word(
@@ -2630,7 +3062,7 @@ fn network_lexicon_candidates(
         ) {
             seen.insert(key.clone());
             words.push(key);
-            if words.len() >= 80 {
+            if words.len() >= 48 {
                 break;
             }
         }
@@ -2638,309 +3070,686 @@ fn network_lexicon_candidates(
     Ok(words)
 }
 
-fn call_network_lexicon(endpoint: &str, api_key: &str, words: &[String]) -> Result<String, String> {
-    let endpoint = endpoint.trim();
-    if !endpoint.contains("{word}") {
-        return Err("词库接口必须包含 {word} 占位符。".to_string());
-    }
-    let temp_dir = std::env::temp_dir().join(format!("cijing-lexicon-{}", unique_suffix()));
-    fs::create_dir_all(&temp_dir).map_err(|err| err.to_string())?;
-    let words_path = temp_dir.join("words.txt");
-    let script_path = temp_dir.join("dict.ps1");
-    fs::write(&words_path, words.join("\n")).map_err(|err| err.to_string())?;
-    fs::write(&script_path, network_lexicon_powershell_script()).map_err(|err| err.to_string())?;
-    let result = run_network_lexicon_powershell(&script_path, endpoint, api_key, &words_path);
-    let _ = fs::remove_dir_all(&temp_dir);
-    result.map(|text| clean_ai_annotations(&text))
+struct BuiltinTranslationOutcome {
+    annotations: String,
+    fallback: bool,
+    warning: &'static str,
+    reason: &'static str,
+    actual_language: String,
+    retry_after_ms: u64,
 }
 
-fn network_lexicon_powershell_script() -> &'static str {
+enum RemoteTranslationDecision {
+    Attempt,
+    CoolingDown(u64),
+    Busy,
+}
+
+fn begin_remote_translation(state: &AppState) -> RemoteTranslationDecision {
+    let mut remote = state
+        .remote_translation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    if let Some(deadline) = remote.cooldown_until
+        && now < deadline
+    {
+        let retry_after_ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .clamp(1_000, u64::MAX as u128) as u64;
+        return RemoteTranslationDecision::CoolingDown(retry_after_ms);
+    }
+    remote.cooldown_until = None;
+    if remote.in_flight {
+        return RemoteTranslationDecision::Busy;
+    }
+    remote.in_flight = true;
+    RemoteTranslationDecision::Attempt
+}
+
+fn finish_remote_translation(state: &AppState, succeeded: bool) {
+    let mut remote = state
+        .remote_translation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    remote.in_flight = false;
+    remote.cooldown_until = (!succeeded).then(|| Instant::now() + REMOTE_TRANSLATION_COOLDOWN);
+}
+
+fn unavailable_translation_outcome(
+    warning: &'static str,
+    reason: &'static str,
+    retry_after_ms: u64,
+) -> BuiltinTranslationOutcome {
+    BuiltinTranslationOutcome {
+        annotations: String::new(),
+        fallback: true,
+        warning,
+        reason,
+        actual_language: String::new(),
+        retry_after_ms,
+    }
+}
+
+fn call_builtin_translation(
+    state: &AppState,
+    target_language: &str,
+    words: &[String],
+) -> BuiltinTranslationOutcome {
+    let Some(provider_language) = builtin_translation_language(target_language) else {
+        return unavailable_translation_outcome(
+            "所选语言暂不受在线翻译支持，未混入中文释义。",
+            "unsupported",
+            0,
+        );
+    };
+    if target_language == "en" {
+        return BuiltinTranslationOutcome {
+            annotations: words
+                .iter()
+                .map(|word| {
+                    let ipa = lookup_generated_ipa(state, word).unwrap_or_default();
+                    format!("{word}={ipa}={word}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            fallback: false,
+            warning: "",
+            reason: "",
+            actual_language: target_language.to_string(),
+            retry_after_ms: 0,
+        };
+    }
+    match begin_remote_translation(state) {
+        RemoteTranslationDecision::CoolingDown(retry_after_ms) => {
+            return unavailable_translation_outcome(
+                "在线翻译服务正在冷却，未混入中文释义。",
+                "cooldown",
+                retry_after_ms,
+            );
+        }
+        RemoteTranslationDecision::Busy => {
+            return unavailable_translation_outcome(
+                "在线翻译服务正忙，未混入中文释义。",
+                "busy",
+                1_500,
+            );
+        }
+        RemoteTranslationDecision::Attempt => {}
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!("yujie-translate-{}", unique_suffix()));
+    if fs::create_dir_all(&temp_dir).is_err() {
+        finish_remote_translation(state, false);
+        return unavailable_translation_outcome(
+            "在线翻译服务暂时不可用，未混入中文释义。",
+            "unavailable",
+            REMOTE_TRANSLATION_COOLDOWN.as_millis() as u64,
+        );
+    }
+    let words_path = temp_dir.join("words.txt");
+    let script_path = temp_dir.join("translate.ps1");
+    if fs::write(&words_path, words.join("\n")).is_err()
+        || fs::write(&script_path, builtin_translation_powershell_script()).is_err()
+    {
+        let _ = fs::remove_dir_all(&temp_dir);
+        finish_remote_translation(state, false);
+        return unavailable_translation_outcome(
+            "在线翻译服务暂时不可用，未混入中文释义。",
+            "unavailable",
+            REMOTE_TRANSLATION_COOLDOWN.as_millis() as u64,
+        );
+    }
+    let result = run_builtin_translation_powershell(&script_path, provider_language, &words_path);
+    let _ = fs::remove_dir_all(&temp_dir);
+    match result {
+        Ok(text) => {
+            let annotations = text
+                .lines()
+                .filter_map(|line| {
+                    let (word, translation) = line.split_once('\t')?;
+                    let word = normalize_key(word);
+                    let translation = translation
+                        .replace(['\r', '\n'], " ")
+                        .replace(['=', '|'], " ")
+                        .trim()
+                        .to_string();
+                    if word.is_empty() || translation.is_empty() {
+                        return None;
+                    }
+                    let ipa = lookup_generated_ipa(state, &word).unwrap_or_default();
+                    Some(format!("{word}={ipa}={translation}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let translated_count = annotations
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            if translated_count == 0 {
+                finish_remote_translation(state, false);
+                unavailable_translation_outcome(
+                    "在线翻译未返回可用的目标语释义，未混入中文释义。",
+                    "incomplete",
+                    REMOTE_TRANSLATION_COOLDOWN.as_millis() as u64,
+                )
+            } else {
+                finish_remote_translation(state, true);
+                BuiltinTranslationOutcome {
+                    annotations,
+                    fallback: false,
+                    warning: "",
+                    reason: "",
+                    actual_language: target_language.to_string(),
+                    retry_after_ms: 0,
+                }
+            }
+        }
+        Err(error) => {
+            finish_remote_translation(state, false);
+            let (warning, reason) = match error.as_str() {
+                "TRANSLATION_RATE_LIMITED" => {
+                    ("在线翻译服务请求过多，未混入中文释义。", "rate_limited")
+                }
+                "TRANSLATION_INCOMPLETE" | "TRANSLATION_EMPTY" => (
+                    "在线翻译未返回可用的目标语释义，未混入中文释义。",
+                    "incomplete",
+                ),
+                _ => ("在线翻译服务暂时不可用，未混入中文释义。", "unavailable"),
+            };
+            unavailable_translation_outcome(
+                warning,
+                reason,
+                REMOTE_TRANSLATION_COOLDOWN.as_millis() as u64,
+            )
+        }
+    }
+}
+
+fn builtin_translation_language(code: &str) -> Option<String> {
+    target_language_name(code)?;
+    Some(
+        match code {
+            "zh-Hans" => "zh-CN",
+            "zh-Hant" => "zh-TW",
+            "jv" => "jav",
+            other => other,
+        }
+        .to_string(),
+    )
+}
+
+fn builtin_translation_powershell_script() -> &'static str {
     r#"
 param(
-  [string]$EndpointTemplate,
-  [string]$ApiKey,
-  [string]$WordsPath
+  [Parameter(Mandatory = $true)][string]$TargetLanguage,
+  [Parameter(Mandatory = $true)][string]$WordsPath
 )
+
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$headers = @{ "Accept" = "application/json" }
-if ($ApiKey -and $ApiKey.Trim().Length -gt 0) {
-  $headers["Authorization"] = "Bearer $ApiKey"
+$utf8 = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8
+$headers = @{
+  "Accept" = "application/json"
+  "User-Agent" = "YujieReader/1.4"
 }
 
-function First-Scalar($value, [int]$depth) {
-  if ($null -eq $value -or $depth -gt 6) { return $null }
-  if ($value -is [string]) {
-    $text = $value.Trim()
-    if ($text.Length -gt 0) { return $text }
-    return $null
-  }
-  if ($value -is [System.ValueType]) { return [string]$value }
-  if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
-    foreach ($item in $value) {
-      $found = First-Scalar $item ($depth + 1)
-      if ($found) { return $found }
-    }
-    return $null
-  }
-  foreach ($prop in $value.PSObject.Properties) {
-    $found = First-Scalar $prop.Value ($depth + 1)
-    if ($found) { return $found }
-  }
-  return $null
+$words = @(
+  Get-Content -LiteralPath $WordsPath |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_.Length -gt 0 } |
+    Select-Object -Unique
+)
+if ($words.Count -eq 0) {
+  exit 0
 }
 
-function Find-Field($obj, [string[]]$names, [int]$depth) {
-  if ($null -eq $obj -or $depth -gt 6) { return $null }
-  foreach ($prop in $obj.PSObject.Properties) {
-    $name = $prop.Name.ToLowerInvariant()
-    foreach ($wanted in $names) {
-      if ($name -eq $wanted -or $name.Contains($wanted)) {
-        $scalar = First-Scalar $prop.Value 0
-        if ($scalar) { return $scalar }
-      }
-    }
-  }
-  foreach ($prop in $obj.PSObject.Properties) {
-    $found = Find-Field $prop.Value $names ($depth + 1)
-    if ($found) { return $found }
-  }
-  return $null
+$nonce = [Guid]::NewGuid().ToString("N").Substring(0, 12).ToUpperInvariant()
+$prefix = "__YJW_${nonce}_"
+$script:result = [ordered]@{}
+$script:edgeRateLimited = $false
+$script:googleRateLimited = $false
+$script:myMemoryRateLimited = $false
+$script:providerUnavailable = $false
+$entries = [Collections.Generic.List[object]]::new()
+
+for ($index = 0; $index -lt $words.Count; $index += 1) {
+  $id = "{0:D3}" -f $index
+  $word = [string]$words[$index]
+  $entries.Add([pscustomobject]@{
+    Word = $word
+    Start = "${prefix}S_${id}__"
+    End = "${prefix}E_${id}__"
+  })
 }
 
-$words = Get-Content -LiteralPath $WordsPath | Where-Object { $_.Trim().Length -gt 0 }
-foreach ($word in $words) {
-  $encoded = [uri]::EscapeDataString($word)
-  $uri = $EndpointTemplate.Replace("{word}", $encoded)
+function Add-Translation {
+  param([string]$Word, [string]$Value)
+  $clean = [Net.WebUtility]::HtmlDecode([string]$Value)
+  $clean = ($clean -replace "[\r\n\t]+", " ").Trim()
+  if (
+    [string]::IsNullOrWhiteSpace($clean) -or
+    $clean -match "^(MYMEMORY WARNING|INVALID TARGET LANGUAGE|QUERY LENGTH LIMIT)"
+  ) {
+    return $false
+  }
+  $script:result[$Word] = $clean
+  return $true
+}
+
+function Get-EdgeLanguage {
+  $edgeLanguage = $TargetLanguage
+  if ($edgeLanguage -eq "mn") {
+    return "mn-Cyrl"
+  }
+  if ($edgeLanguage -eq "no") {
+    return "nb"
+  }
+  if ($edgeLanguage -eq "sr") {
+    return "sr-Cyrl"
+  }
+  if ($edgeLanguage -eq "ny") {
+    return "nya"
+  }
+  if ($edgeLanguage -eq "zh-TW") {
+    return "zh-Hant"
+  }
+  if ($edgeLanguage -eq "pt-BR") {
+    return "pt"
+  }
+  if ($edgeLanguage -eq "pt-PT") {
+    return "pt-pt"
+  }
+  if ($edgeLanguage -in @("jav", "su", "ceb", "tg", "om")) {
+    return ""
+  }
+  return $edgeLanguage
+}
+
+function Invoke-EdgeBatches {
+  param([object[]]$Items)
+  $edgeLanguage = Get-EdgeLanguage
+  if ($Items.Count -eq 0 -or [string]::IsNullOrWhiteSpace($edgeLanguage)) {
+    return
+  }
   try {
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -TimeoutSec 15
-    $ipa = Find-Field $response @("ipa", "phonetic", "pronunciation", "usphone", "ukphone", "phone", "pron") 0
-    $zh = Find-Field $response @("zh", "chinese", "translation", "trans", "explain", "meaning", "definition") 0
-    if ($ipa -and $zh) {
-      $ipa = ($ipa -replace "`r|`n", " ").Trim()
-      $zh = ($zh -replace "`r|`n", " ").Trim()
-      if ($ipa.Length -gt 0 -and $zh.Length -gt 0) {
-        "$word=$ipa=$zh"
-      }
+    $token = [string](Invoke-RestMethod `
+      -Uri "https://edge.microsoft.com/translate/auth" `
+      -Method Get `
+      -Headers $headers `
+      -TimeoutSec 8)
+    if ([string]::IsNullOrWhiteSpace($token)) {
+      $script:providerUnavailable = $true
+      return
     }
   } catch {
+    $statusCode = 0
+    if ($null -ne $_.Exception.Response) {
+      try {
+        $statusCode = [int]$_.Exception.Response.StatusCode
+      } catch {
+        $statusCode = 0
+      }
+    }
+    if ($statusCode -eq 429) {
+      $script:edgeRateLimited = $true
+    } else {
+      $script:providerUnavailable = $true
+    }
+    return
+  }
+
+  for ($offset = 0; $offset -lt $Items.Count; $offset += 25) {
+    $last = [Math]::Min($offset + 24, $Items.Count - 1)
+    $batch = @($Items[$offset..$last])
+    $texts = @(
+      $batch |
+        ForEach-Object { [pscustomobject]@{ Text = $_.Word } }
+    )
+    $body = ConvertTo-Json -InputObject $texts -Compress
+    try {
+      $rawResponse = Invoke-RestMethod `
+        -Uri (
+          "https://api-edge.cognitive.microsofttranslator.com/translate" +
+          "?api-version=3.0&from=en&to=" +
+          [Uri]::EscapeDataString($edgeLanguage)
+        ) `
+        -Method Post `
+        -Headers @{
+          "Authorization" = "Bearer $token"
+          "X-ClientTraceId" = [Guid]::NewGuid().ToString()
+        } `
+        -ContentType "application/json; charset=UTF-8" `
+        -Body ([Text.Encoding]::UTF8.GetBytes($body)) `
+        -TimeoutSec 8
+      $response = @($rawResponse)
+      $limit = [Math]::Min($batch.Count, $response.Count)
+      for ($index = 0; $index -lt $limit; $index += 1) {
+        $value = [string]$response[$index].translations[0].text
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+          [void](Add-Translation -Word $batch[$index].Word -Value $value)
+        }
+      }
+    } catch {
+      $statusCode = 0
+      if ($null -ne $_.Exception.Response) {
+        try {
+          $statusCode = [int]$_.Exception.Response.StatusCode
+        } catch {
+          $statusCode = 0
+        }
+      }
+      if ($statusCode -eq 429) {
+        $script:edgeRateLimited = $true
+      } else {
+        $script:providerUnavailable = $true
+      }
+      return
+    }
+  }
+}
+
+function Invoke-MyMemoryBatch {
+  param([object[]]$Items)
+  if ($Items.Count -eq 0) {
+    return $true
+  }
+  $payload = (($Items | ForEach-Object { $_.Word }) -join " | ")
+  try {
+    $uri = "https://api.mymemory.translated.net/get?q=" +
+      [Uri]::EscapeDataString($payload) +
+      "&langpair=en%7C" +
+      [Uri]::EscapeDataString($TargetLanguage)
+    $response = Invoke-RestMethod `
+      -Uri $uri `
+      -Method Get `
+      -Headers $headers `
+      -TimeoutSec 8
+    $responseStatus = [int]$response.responseStatus
+    $translated = [Net.WebUtility]::HtmlDecode(
+      [string]$response.responseData.translatedText
+    )
+    if (
+      $responseStatus -eq 429 -or
+      [string]$response.quotaFinished -eq "True" -or
+      $translated -match "^MYMEMORY WARNING"
+    ) {
+      $script:myMemoryRateLimited = $true
+      return $false
+    }
+    if (
+      $responseStatus -ne 200 -or
+      [string]::IsNullOrWhiteSpace($translated) -or
+      $translated -match "^(INVALID TARGET LANGUAGE|QUERY LENGTH LIMIT)"
+    ) {
+      $script:providerUnavailable = $true
+      return $false
+    }
+    $parts = @($translated -split "\|")
+    if ($parts.Count -ne $Items.Count) {
+      $script:providerUnavailable = $true
+      return $false
+    }
+    $pending = [ordered]@{}
+    for ($index = 0; $index -lt $Items.Count; $index += 1) {
+      $value = ($parts[$index] -replace "[\r\n\t]+", " ").Trim()
+      if (
+        [string]::IsNullOrWhiteSpace($value) -or
+        $value -match "^(MYMEMORY WARNING|INVALID TARGET LANGUAGE|QUERY LENGTH LIMIT)"
+      ) {
+        continue
+      }
+      $pending[$Items[$index].Word] = $value
+    }
+    foreach ($translation in $pending.GetEnumerator()) {
+      [void](Add-Translation -Word $translation.Key -Value $translation.Value)
+    }
+    return $pending.Count -gt 0
+  } catch {
+    $statusCode = 0
+    if ($null -ne $_.Exception.Response) {
+      try {
+        $statusCode = [int]$_.Exception.Response.StatusCode
+      } catch {
+        $statusCode = 0
+      }
+    }
+    if ($statusCode -eq 429) {
+      $script:myMemoryRateLimited = $true
+    } else {
+      $script:providerUnavailable = $true
+    }
+    return $false
+  }
+}
+
+function Invoke-MyMemoryBatches {
+  param([object[]]$Items)
+  $current = [Collections.Generic.List[object]]::new()
+  foreach ($item in $Items) {
+    $candidateWords = @($current | ForEach-Object { $_.Word }) + @($item.Word)
+    $candidate = ($candidateWords -join " | ")
+    if (
+      $current.Count -gt 0 -and
+      [Text.Encoding]::UTF8.GetByteCount($candidate) -gt 420
+    ) {
+      [void](Invoke-MyMemoryBatch -Items $current.ToArray())
+      $current.Clear()
+    }
+    $current.Add($item)
+  }
+  if ($current.Count -gt 0) {
+    [void](Invoke-MyMemoryBatch -Items $current.ToArray())
+  }
+}
+
+function Get-TokenCount {
+  param([string]$Text, [string]$Token)
+  $count = 0
+  $offset = 0
+  while ($offset -le $Text.Length) {
+    $found = $Text.IndexOf($Token, $offset, [StringComparison]::Ordinal)
+    if ($found -lt 0) {
+      break
+    }
+    $count += 1
+    $offset = $found + $Token.Length
+  }
+  return $count
+}
+
+function Invoke-GoogleProvider {
+  param([string]$Payload)
+  $googleLanguage = $TargetLanguage
+  if ($googleLanguage -eq "jav") {
+    $googleLanguage = "jw"
+  } elseif ($googleLanguage -eq "fil") {
+    $googleLanguage = "tl"
+  } elseif ($googleLanguage -in @("pt-BR", "pt-PT")) {
+    $googleLanguage = "pt"
+  }
+  try {
+    $response = Invoke-RestMethod `
+      -Uri "https://translate.googleapis.com/translate_a/single" `
+      -Method Post `
+      -Headers $headers `
+      -ContentType "application/x-www-form-urlencoded; charset=UTF-8" `
+      -Body @{
+        client = "gtx"
+        sl = "en"
+        tl = $googleLanguage
+        dt = "t"
+        q = $Payload
+      } `
+      -TimeoutSec 8
+    if ($null -eq $response -or $null -eq $response[0]) {
+      return $null
+    }
+    $translated = (
+      $response[0] |
+        ForEach-Object {
+          if ($null -ne $_ -and $null -ne $_[0]) {
+            [string]$_[0]
+          }
+        }
+    ) -join ""
+    if ([string]::IsNullOrWhiteSpace($translated)) {
+      return $null
+    }
+    return $translated
+  } catch {
+    $statusCode = 0
+    if ($null -ne $_.Exception.Response) {
+      try {
+        $statusCode = [int]$_.Exception.Response.StatusCode
+      } catch {
+        $statusCode = 0
+      }
+    }
+    if ($statusCode -eq 429) {
+      $script:googleRateLimited = $true
+    } else {
+      $script:providerUnavailable = $true
+    }
+    return $null
+  }
+}
+
+function Try-ProcessGoogleBatch {
+  param([object[]]$Items)
+  $records = [Collections.Generic.List[string]]::new()
+  foreach ($item in $Items) {
+    $records.Add($item.Start + $item.Word + $item.End)
+  }
+  $translated = Invoke-GoogleProvider -Payload ($records -join "`n")
+  if ([string]::IsNullOrWhiteSpace($translated)) {
+    return $false
+  }
+  $pending = [ordered]@{}
+  foreach ($item in $Items) {
+    if ((Get-TokenCount -Text $translated -Token $item.Start) -ne 1) {
+      return $false
+    }
+    if ((Get-TokenCount -Text $translated -Token $item.End) -ne 1) {
+      return $false
+    }
+    $startIndex = $translated.IndexOf($item.Start, [StringComparison]::Ordinal)
+    $valueStart = $startIndex + $item.Start.Length
+    $endIndex = $translated.IndexOf(
+      $item.End,
+      $valueStart,
+      [StringComparison]::Ordinal
+    )
+    if ($startIndex -lt 0 -or $endIndex -lt $valueStart) {
+      return $false
+    }
+    $value = $translated.Substring($valueStart, $endIndex - $valueStart).Trim()
+    if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains($prefix)) {
+      return $false
+    }
+    $pending[$item.Word] = $value
+  }
+  foreach ($translation in $pending.GetEnumerator()) {
+    $script:result[$translation.Key] = $translation.Value
+  }
+  return $true
+}
+
+Invoke-EdgeBatches -Items ($entries.ToArray())
+$myMemoryMissing = @(
+  $entries |
+    Where-Object { -not $script:result.Contains($_.Word) }
+)
+if ($myMemoryMissing.Count -gt 0) {
+  Invoke-MyMemoryBatches -Items $myMemoryMissing
+}
+$missing = @(
+  $entries |
+    Where-Object { -not $script:result.Contains($_.Word) }
+)
+if ($missing.Count -gt 0) {
+  [void](Try-ProcessGoogleBatch -Items $missing)
+}
+
+if ($script:result.Count -eq 0) {
+  if (
+    $script:edgeRateLimited -or
+    $script:googleRateLimited -or
+    $script:myMemoryRateLimited
+  ) {
+    [Console]::Error.WriteLine("RATE_LIMITED")
+    exit 29
+  }
+  [Console]::Error.WriteLine("PROVIDER_UNAVAILABLE")
+  exit 30
+}
+foreach ($word in $words) {
+  if ($script:result.Contains($word)) {
+    "$word`t$($script:result[$word])"
   }
 }
 "#
 }
 
-fn run_network_lexicon_powershell(
+fn run_builtin_translation_powershell(
     script_path: &Path,
-    endpoint: &str,
-    api_key: &str,
+    target_language: String,
     words_path: &Path,
 ) -> Result<String, String> {
-    let shell = if Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg("$PSVersionTable.PSVersion")
-        .output()
-        .is_ok()
-    {
-        "powershell.exe"
-    } else {
-        "pwsh"
-    };
-    let mut child = Command::new(shell)
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script_path.to_string_lossy(),
-            "-EndpointTemplate",
-            endpoint,
-            "-ApiKey",
-            api_key,
-            "-WordsPath",
-            &words_path.to_string_lossy(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("无法启动网络词库请求：{err}"))?;
+    let args = vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-File".to_string(),
+        script_path.to_string_lossy().into_owned(),
+        "-TargetLanguage".to_string(),
+        target_language,
+        "-WordsPath".to_string(),
+        words_path.to_string_lossy().into_owned(),
+    ];
+    let mut child =
+        spawn_background_powershell(&args).map_err(|err| format!("无法启动内置翻译：{err}"))?;
 
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
             break status;
         }
-        if started.elapsed() > Duration::from_secs(75) {
+        if started.elapsed() > Duration::from_secs(20) {
             let _ = child.kill();
-            return Err("网络词库请求超时。".to_string());
+            let _ = child.wait();
+            return Err("TRANSLATION_TIMEOUT".to_string());
         }
         thread::sleep(Duration::from_millis(200));
     };
 
-    let mut stdout = String::new();
+    let mut stdout_bytes = Vec::new();
     if let Some(mut stream) = child.stdout.take() {
-        let _ = stream.read_to_string(&mut stdout);
+        let _ = stream.read_to_end(&mut stdout_bytes);
     }
-    let mut stderr = String::new();
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let mut stderr_bytes = Vec::new();
     if let Some(mut stream) = child.stderr.take() {
-        let _ = stream.read_to_string(&mut stderr);
+        let _ = stream.read_to_end(&mut stderr_bytes);
     }
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     if !status.success() {
-        let message = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        return Err(format!("网络词库查询失败：{message}"));
+        if stderr.contains("RATE_LIMITED") || stdout.contains("RATE_LIMITED") {
+            return Err("TRANSLATION_RATE_LIMITED".to_string());
+        }
+        if stderr.contains("TRANSLATION_INCOMPLETE") {
+            return Err("TRANSLATION_INCOMPLETE".to_string());
+        }
+        return Err("TRANSLATION_UNAVAILABLE".to_string());
     }
     if stdout.trim().is_empty() {
-        return Err("网络词库没有返回可用的中文释义和音标。".to_string());
+        return Err("TRANSLATION_EMPTY".to_string());
     }
-    Ok(stdout)
-}
-
-fn call_ai_annotations(
-    endpoint: &str,
-    model: &str,
-    api_key: &str,
-    grade: &str,
-    article: &str,
-) -> Result<String, String> {
-    let system_prompt = concat!(
-        "你是英语精读标注助手。请只输出自定义标注行，不要解释，不要 Markdown。",
-        "每行格式必须是 word=IPA=中文短释义。",
-        "IPA 使用国际音标，不要用 KK 或拼音；中文释义不超过 8 个汉字。",
-        "只选择文中需要标注或你能明显改进音标/释义的词。"
-    );
-    let user_prompt = format!("学生年级：{grade}\n英文文章：\n{article}");
-    let request_body = format!(
-        concat!(
-            "{{\"model\":\"{}\",\"temperature\":0.1,",
-            "\"messages\":[",
-            "{{\"role\":\"system\",\"content\":\"{}\"}},",
-            "{{\"role\":\"user\",\"content\":\"{}\"}}",
-            "]}}"
-        ),
-        json_escape(model),
-        json_escape(system_prompt),
-        json_escape(&user_prompt)
-    );
-
-    let temp_dir = std::env::temp_dir().join(format!("cijing-ai-{}", unique_suffix()));
-    fs::create_dir_all(&temp_dir).map_err(|err| err.to_string())?;
-    let body_path = temp_dir.join("request.json");
-    let script_path = temp_dir.join("call.ps1");
-    fs::write(&body_path, request_body).map_err(|err| err.to_string())?;
-    fs::write(&script_path, ai_powershell_script()).map_err(|err| err.to_string())?;
-    let result = run_ai_powershell(&script_path, endpoint, api_key, &body_path);
-    let _ = fs::remove_dir_all(&temp_dir);
-    result.map(|text| clean_ai_annotations(&text))
-}
-
-fn ai_powershell_script() -> &'static str {
-    r#"
-param(
-  [string]$Endpoint,
-  [string]$ApiKey,
-  [string]$BodyPath
-)
-$ErrorActionPreference = "Stop"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$headers = @{ "Content-Type" = "application/json" }
-if ($ApiKey -and $ApiKey.Trim().Length -gt 0) {
-  $headers["Authorization"] = "Bearer $ApiKey"
-}
-$body = Get-Content -Raw -LiteralPath $BodyPath
-$response = Invoke-RestMethod -Uri $Endpoint -Method Post -Headers $headers -Body $body -TimeoutSec 45
-if ($response.choices -and $response.choices.Count -gt 0) {
-  $response.choices[0].message.content
-} elseif ($response.content) {
-  $response.content
-} else {
-  $response | ConvertTo-Json -Depth 20
-}
-"#
-}
-
-fn run_ai_powershell(
-    script_path: &Path,
-    endpoint: &str,
-    api_key: &str,
-    body_path: &Path,
-) -> Result<String, String> {
-    let shell = if Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg("$PSVersionTable.PSVersion")
-        .output()
-        .is_ok()
-    {
-        "powershell.exe"
-    } else {
-        "pwsh"
-    };
-    let mut child = Command::new(shell)
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script_path.to_string_lossy(),
-            "-Endpoint",
-            endpoint,
-            "-ApiKey",
-            api_key,
-            "-BodyPath",
-            &body_path.to_string_lossy(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("无法启动网络请求：{err}"))?;
-
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
-            break status;
-        }
-        if started.elapsed() > Duration::from_secs(60) {
-            let _ = child.kill();
-            return Err("AI 增强请求超时。".to_string());
-        }
-        thread::sleep(Duration::from_millis(200));
-    };
-
-    let mut stdout = String::new();
-    if let Some(mut stream) = child.stdout.take() {
-        let _ = stream.read_to_string(&mut stdout);
-    }
-    let mut stderr = String::new();
-    if let Some(mut stream) = child.stderr.take() {
-        let _ = stream.read_to_string(&mut stderr);
-    }
-    if !status.success() {
-        let message = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        return Err(format!("AI 增强失败：{message}"));
-    }
-    Ok(stdout)
-}
-
-fn clean_ai_annotations(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| {
-            !line.is_empty()
-                && !line.starts_with("```")
-                && line.matches('=').count() >= 2
-                && line.len() <= 120
-        })
-        .map(|line| line.trim_matches(['-', '*', ' ']).to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
+    Ok(stdout.into_owned())
 }
 
 fn text_sizes_from_json(body: &str) -> TextSizes {
@@ -3254,9 +4063,14 @@ fn route_request(
     let path = raw_path.split('?').next().unwrap_or("/");
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => html(INDEX_HTML),
+        ("GET", "/ui-language-packs.js") => {
+            text(UI_LANGUAGE_PACKS_JS, "text/javascript; charset=utf-8")
+        }
+        ("GET", "/i18n.js") => text(I18N_JS, "text/javascript; charset=utf-8"),
         ("GET", "/app.js") => text(APP_JS, "text/javascript; charset=utf-8"),
         ("GET", "/editor-tools.js") => text(EDITOR_TOOLS_JS, "text/javascript; charset=utf-8"),
         ("GET", "/styles.css") => text(STYLES_CSS, "text/css; charset=utf-8"),
+        ("GET", "/brand/logo-64.png") => binary(BRAND_LOGO_PNG, "image/png"),
         ("GET", "/api/profiles") => json(200, profiles_json(state)),
         ("GET", "/api/demo") => json(
             200,
@@ -3281,12 +4095,8 @@ fn route_request(
             let (status, payload) = handle_dictionary(state, body);
             json(status, payload)
         }
-        ("POST", "/api/ai-enhance") => {
-            let (status, payload) = handle_ai_enhance(body);
-            json(status, payload)
-        }
-        ("POST", "/api/network-lexicon") => {
-            let (status, payload) = handle_network_lexicon(state, body);
+        ("POST", "/api/builtin-translate") => {
+            let (status, payload) = handle_builtin_translate(state, body);
             json(status, payload)
         }
         ("GET", path) if path.starts_with("/download/") => serve_download(path),
@@ -3300,6 +4110,10 @@ fn html(body: &str) -> (u16, &'static str, Vec<u8>, Vec<String>) {
 
 fn text(body: &str, mime: &'static str) -> (u16, &'static str, Vec<u8>, Vec<String>) {
     (200, mime, body.as_bytes().to_vec(), Vec::new())
+}
+
+fn binary(body: &[u8], mime: &'static str) -> (u16, &'static str, Vec<u8>, Vec<String>) {
+    (200, mime, body.to_vec(), Vec::new())
 }
 
 fn json(status: u16, body: String) -> (u16, &'static str, Vec<u8>, Vec<String>) {
@@ -3366,15 +4180,17 @@ fn bind_server() -> Result<(TcpListener, u16), String> {
 fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+        let _ = background_command("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").arg(url).spawn();
+        let _ = background_command("open").arg(url).spawn();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = Command::new("xdg-open").arg(url).spawn();
+        let _ = background_command("xdg-open").arg(url).spawn();
     }
 }
 
@@ -3418,6 +4234,8 @@ fn main() -> Result<(), String> {
             "glittered=ˈɡlɪt.ərd=闪闪发光",
             true,
             "P4",
+            "zh-Hans",
+            "ipa-us",
             TextSizes::default_body(),
         )?;
         println!(
@@ -3451,7 +4269,7 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
-    println!("词境精读 Rust 版运行中: {url}");
+    println!("语界精读 Rust 版运行中: {url}");
     if !no_open {
         open_browser(&url);
     }
@@ -3532,6 +4350,9 @@ mod windows_gui {
     const DEFAULT_GUI_FONT: i32 = 17;
     const SWP_NOZORDER: Uint = 0x0004;
     const SWP_NOACTIVATE: Uint = 0x0010;
+    const IMAGE_ICON: Uint = 1;
+    const LR_LOADFROMFILE: Uint = 0x0010;
+    const LR_DEFAULTSIZE: Uint = 0x0040;
 
     const ID_DEMO: usize = 1001;
     const ID_CLEAR: usize = 1002;
@@ -3627,6 +4448,14 @@ mod windows_gui {
         fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
         fn GetWindowTextW(hwnd: Hwnd, lp_string: *mut u16, n_max_count: i32) -> i32;
         fn LoadCursorW(h_instance: Hinstance, lp_cursor_name: *const u16) -> Hcursor;
+        fn LoadImageW(
+            h_instance: Hinstance,
+            name: *const u16,
+            image_type: Uint,
+            width: i32,
+            height: i32,
+            load_flags: Uint,
+        ) -> *mut c_void;
         fn MessageBoxW(hwnd: Hwnd, text: *const u16, caption: *const u16, typ: Uint) -> i32;
         fn MoveWindow(hwnd: Hwnd, x: i32, y: i32, width: i32, height: i32, repaint: Bool) -> Bool;
         fn PostMessageW(hwnd: Hwnd, msg: Uint, w_param: Wparam, l_param: Lparam) -> Bool;
@@ -3739,6 +4568,24 @@ mod windows_gui {
         (to_logical(physical_width), to_logical(physical_height))
     }
 
+    fn load_brand_icon() -> Hicon {
+        let icon_path = std::env::temp_dir().join("yujie-reader-icon.ico");
+        if fs::write(&icon_path, BRAND_ICON_ICO).is_err() {
+            return null_mut();
+        }
+        let icon_path = wide(&icon_path.to_string_lossy());
+        unsafe {
+            LoadImageW(
+                null_mut(),
+                icon_path.as_ptr(),
+                IMAGE_ICON,
+                0,
+                0,
+                LR_LOADFROMFILE | LR_DEFAULTSIZE,
+            ) as Hicon
+        }
+    }
+
     unsafe fn initial_window_bounds() -> (i32, i32, i32, i32) {
         let mut work_area = Rect {
             left: 0,
@@ -3773,13 +4620,14 @@ mod windows_gui {
             }
 
             let class_name = wide("CijingReaderWebViewWindow");
+            let brand_icon = load_brand_icon();
             let class = WndClassW {
                 style: 0,
                 lpfn_wnd_proc: Some(webview_window_proc),
                 cb_cls_extra: 0,
                 cb_wnd_extra: 0,
                 h_instance: instance,
-                h_icon: null_mut(),
+                h_icon: brand_icon,
                 h_cursor: LoadCursorW(null_mut(), 32512usize as *const u16),
                 hbr_background: (16 + 1) as Hbrush,
                 lpsz_menu_name: null(),
@@ -3789,7 +4637,7 @@ mod windows_gui {
                 return Err("注册内嵌界面窗口失败。".to_string());
             }
 
-            let window_title = wide("词境精读");
+            let window_title = wide("语界精读");
             let (window_x, window_y, window_width, window_height) = initial_window_bounds();
             let hwnd = CreateWindowExW(
                 0,
@@ -3867,7 +4715,7 @@ mod windows_gui {
                     if request.body() == "open-output-folder" {
                         let output_dir = app_output_dir();
                         let _ = fs::create_dir_all(&output_dir);
-                        let _ = Command::new("explorer").arg(output_dir).spawn();
+                        let _ = background_command("explorer").arg(output_dir).spawn();
                     }
                 })
                 .build_as_child(&host)
@@ -4027,13 +4875,14 @@ mod windows_gui {
             }
 
             let class_name = wide("CijingReaderRustWindow");
+            let brand_icon = load_brand_icon();
             let class = WndClassW {
                 style: 0,
                 lpfn_wnd_proc: Some(window_proc),
                 cb_cls_extra: 0,
                 cb_wnd_extra: 0,
                 h_instance: instance,
-                h_icon: null_mut(),
+                h_icon: brand_icon,
                 h_cursor: LoadCursorW(null_mut(), 32512usize as *const u16),
                 hbr_background: (16 + 1) as Hbrush,
                 lpsz_menu_name: null(),
@@ -4044,7 +4893,7 @@ mod windows_gui {
             }
 
             let data_ptr = Box::into_raw(Box::new(GuiData::new(state)));
-            let window_title = wide("词境精读");
+            let window_title = wide("语界精读");
             let hwnd = CreateWindowExW(
                 0,
                 class_name.as_ptr(),
@@ -4494,6 +5343,8 @@ mod windows_gui {
             &custom,
             annotate_unknown,
             &grade_code,
+            "zh-Hans",
+            "ipa-us",
             data.text_sizes(),
         ) {
             Ok(missing) => {
@@ -4577,7 +5428,7 @@ mod windows_gui {
             MessageBoxW(
                 hwnd,
                 wide(text).as_ptr(),
-                wide("词境精读").as_ptr(),
+                wide("语界精读").as_ptr(),
                 MB_OK | icon,
             )
         };
@@ -4635,6 +5486,282 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(mime, "text/javascript; charset=utf-8");
         assert!(body.starts_with(b"(() =>"));
+
+        let (status, mime, body, _) = route_request(state(), "GET", "/i18n.js", "");
+        assert_eq!(status, 200);
+        assert_eq!(mime, "text/javascript; charset=utf-8");
+        assert!(
+            body.windows(b"YujieI18n".len())
+                .any(|window| window == b"YujieI18n")
+        );
+
+        let (status, mime, body, _) = route_request(state(), "GET", "/ui-language-packs.js", "");
+        assert_eq!(status, 200);
+        assert_eq!(mime, "text/javascript; charset=utf-8");
+        assert_eq!(body, UI_LANGUAGE_PACKS_JS.as_bytes());
+    }
+
+    #[test]
+    fn removes_user_api_and_network_lexicon_entry_points() {
+        for path in ["/api/ai-enhance", "/api/network-lexicon"] {
+            let (status, _, _, _) = route_request(state(), "POST", path, "{}");
+            assert_eq!(status, 404);
+        }
+        for removed_id in [
+            "aiEndpoint",
+            "aiModel",
+            "aiKey",
+            "lexiconEndpoint",
+            "lexiconKey",
+        ] {
+            assert!(!INDEX_HTML.contains(removed_id));
+        }
+    }
+
+    #[test]
+    fn validates_global_language_and_pronunciation_preferences() {
+        assert_eq!(target_language_name("es"), Some("西班牙语"));
+        assert_eq!(target_language_name("sw"), Some("斯瓦希里语"));
+        assert_eq!(target_language_name("jv"), Some("爪哇语"));
+        assert_eq!(target_language_name("ps"), Some("普什图语"));
+        assert_eq!(target_language_name("ig"), Some("伊博语"));
+        assert_eq!(target_language_name("not-a-language"), None);
+        assert_eq!(
+            target_language(r#"{"targetLanguage":"not-a-language"}"#),
+            "zh-Hans"
+        );
+        assert_eq!(
+            pronunciation_scheme(r#"{"pronunciationScheme":"none"}"#),
+            "none"
+        );
+        assert_eq!(
+            pronunciation_scheme(r#"{"pronunciationScheme":"unknown"}"#),
+            "ipa-us"
+        );
+        assert_eq!(
+            builtin_translation_language("zh-Hant").as_deref(),
+            Some("zh-TW")
+        );
+        assert_eq!(
+            builtin_translation_language("pt-BR").as_deref(),
+            Some("pt-BR")
+        );
+        assert_eq!(builtin_translation_language("jv").as_deref(), Some("jav"));
+        assert_eq!(builtin_translation_language("fil").as_deref(), Some("fil"));
+        assert_eq!(builtin_translation_language("not-a-language"), None);
+        let translation_script = builtin_translation_powershell_script();
+        assert!(translation_script.contains("__YJW_"));
+        assert!(translation_script.contains("edge.microsoft.com/translate/auth"));
+        assert!(translation_script.contains("api-edge.cognitive.microsofttranslator.com"));
+        assert!(translation_script.contains("$offset += 25"));
+        assert!(translation_script.contains("api.mymemory.translated.net/get"));
+        assert!(translation_script.contains("-Method Get"));
+        assert!(translation_script.contains("-Method Post"));
+        assert!(translation_script.contains("-join \" | \""));
+        assert!(translation_script.contains("GetByteCount($candidate) -gt 420"));
+        assert!(translation_script.contains("-TimeoutSec 8"));
+        assert!(translation_script.contains("RATE_LIMITED"));
+        assert!(translation_script.contains("PROVIDER_UNAVAILABLE"));
+        assert!(!translation_script.contains("function Process-Entries"));
+        assert!(!translation_script.contains("throw $script:lastProviderError"));
+    }
+
+    #[test]
+    fn unavailable_target_translation_never_uses_chinese_or_leaks_script_details() {
+        let app_state = state();
+        {
+            let mut remote = app_state.remote_translation.lock().unwrap();
+            remote.cooldown_until = Some(Instant::now() + Duration::from_secs(60));
+            remote.in_flight = false;
+        }
+
+        let body = r#"{
+            "article":"The ubiquitous phenomenon bewildered everyone.",
+            "grade":"P1",
+            "targetLanguage":"es"
+        }"#;
+        let (status, payload) = handle_builtin_translate(app_state, body);
+
+        {
+            let mut remote = app_state.remote_translation.lock().unwrap();
+            remote.cooldown_until = None;
+            remote.in_flight = false;
+        }
+        assert_eq!(status, 200);
+        assert!(payload.contains("\"fallback\":true"));
+        assert!(payload.contains("\"warning\":\"在线翻译服务正在冷却"));
+        assert!(payload.contains("\"reason\":\"cooldown\""));
+        assert!(payload.contains("\"actualLanguage\":\"\""));
+        assert!(payload.contains("\"retryAfterMs\":"));
+        assert!(payload.contains("\"annotations\":\"\""));
+        assert!(!payload.contains("ECDICT"));
+        assert!(payload.contains("未混入中文释义"));
+        assert!(!payload.contains("translate.ps1"));
+        assert!(!payload.contains("AppData"));
+        assert!(!payload.contains("FullyQualifiedErrorId"));
+
+        {
+            let mut remote = app_state.remote_translation.lock().unwrap();
+            remote.cooldown_until = None;
+            remote.in_flight = true;
+        }
+        let (busy_status, busy_payload) = handle_builtin_translate(app_state, body);
+        {
+            let mut remote = app_state.remote_translation.lock().unwrap();
+            remote.in_flight = false;
+        }
+        assert_eq!(busy_status, 200);
+        assert!(busy_payload.contains("\"reason\":\"busy\""));
+        assert!(busy_payload.contains("\"retryAfterMs\":1500"));
+    }
+
+    #[test]
+    fn local_chinese_dictionary_still_contains_definition_and_ipa() {
+        let translation =
+            lookup_generated_translation(state(), "beautiful").expect("definition should exist");
+        let ipa = lookup_generated_ipa(state(), "beautiful").expect("IPA should exist");
+        assert!(translation.contains("美"));
+        assert!(!ipa.is_empty());
+        assert!(lookup_generated_translation(state(), "zzzxqvnonword").is_none());
+    }
+
+    #[test]
+    fn uses_only_embedded_ui_language_packs() {
+        let translation_options = INDEX_HTML
+            .split_once("id=\"translationLanguage\"")
+            .and_then(|(_, tail)| tail.split_once("</select>"))
+            .map(|(select, _)| select.matches("<option value=").count())
+            .unwrap_or_default();
+        assert_eq!(translation_options, 98);
+        for code in ["jv", "ps", "ku", "ht", "om", "ug"] {
+            assert!(INDEX_HTML.contains(&format!("<option value=\"{code}\">")));
+            assert!(I18N_JS.contains(&format!("{code}: [")));
+        }
+        assert!(
+            INDEX_HTML.contains("id=\"previewCanvas\" class=\"preview-canvas\" data-i18n-skip")
+        );
+        assert!(
+            I18N_JS
+                .contains("Object.keys(sanitized).length === Object.keys(englishCatalog).length")
+        );
+        let (status, _, _, _) = route_request(state(), "POST", "/api/ui-language-pack", "{}");
+        assert_eq!(status, 404);
+        assert!(!I18N_JS.contains("fetch(\"/api/ui-language-pack"));
+    }
+
+    #[test]
+    fn uses_embedded_fast_language_switching_paths() {
+        let bundle_position = INDEX_HTML
+            .find("src=\"/ui-language-packs.js\"")
+            .expect("embedded language bundle should load");
+        let i18n_position = INDEX_HTML
+            .find("src=\"/i18n.js\"")
+            .expect("i18n runtime should load");
+        assert!(bundle_position < i18n_position);
+        assert!(UI_LANGUAGE_PACKS_JS.contains("\"version\":\"2-95eyir\""));
+        assert!(!UI_LANGUAGE_PACKS_JS.contains("\"packs\":{}"));
+        assert!(UI_LANGUAGE_PACKS_JS.contains("\"zh-Hant\":{"));
+        assert!(UI_LANGUAGE_PACKS_JS.contains("\"ny\":{"));
+        assert!(I18N_JS.contains("global.YujieUiLanguagePacks"));
+        assert!(I18N_JS.contains("exportCatalog"));
+        assert!(APP_JS.contains("const AUTO_TRANSLATION_CACHE_VERSION = 2"));
+        assert!(APP_JS.contains("const MAX_AUTO_TRANSLATION_CACHE_ENTRIES = 12"));
+        assert!(APP_JS.contains("translateAbortController"));
+        assert!(APP_JS.contains("findCachedAutoTranslations"));
+        assert!(APP_JS.contains("looksLikeChineseFallback"));
+        assert!(APP_JS.contains("actualLanguage"));
+        assert!(APP_JS.contains("未使用中文回退"));
+        assert!(!APP_JS.contains("transientTranslationFallbacks"));
+        assert!(!APP_JS.contains("select.disabled = true"));
+        assert!(I18N_JS.contains("control.disabled = false"));
+        assert!(EDITOR_TOOLS_JS.contains("\"autoTranslationCache\""));
+        assert!(INDEX_HTML.contains("id=\"autoTranslationCache\""));
+    }
+
+    #[test]
+    fn parses_batched_translation_script_without_network() {
+        let temp_dir = std::env::temp_dir().join(format!("yujie-script-test-{}", unique_suffix()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let script_path = temp_dir.join("translate.ps1");
+        let words_path = temp_dir.join("words.txt");
+        fs::write(&script_path, builtin_translation_powershell_script()).unwrap();
+        fs::write(&words_path, "").unwrap();
+        let output = background_command("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &script_path.to_string_lossy(),
+                "-TargetLanguage",
+                "es",
+                "-WordsPath",
+                &words_path.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        let _ = fs::remove_dir_all(&temp_dir);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn renders_every_enabled_pronunciation_scheme() {
+        let source = "ˈbjutəfəl";
+        let us = format_pronunciation(source, "ipa-us");
+        let uk = format_pronunciation(source, "ipa-uk");
+        let generic = format_pronunciation(source, "ipa");
+        let friendly = format_pronunciation(source, "target-friendly");
+        let syllable = format_pronunciation(source, "syllable");
+
+        for rendered in [&us, &uk, &generic, &friendly, &syllable] {
+            assert!(!rendered.is_empty());
+        }
+        assert_ne!(us, uk);
+        assert_ne!(us, friendly);
+        assert_ne!(us, syllable);
+        assert!(syllable.contains('·'));
+        assert_eq!(format_pronunciation(source, "none"), "");
+    }
+
+    #[test]
+    fn cmudict_comments_are_not_loaded_as_phonemes() {
+        assert!(
+            state()
+                .pronunciations
+                .values()
+                .flatten()
+                .flatten()
+                .all(|phone| !phone.starts_with('#'))
+        );
+    }
+
+    #[test]
+    fn non_chinese_preview_avoids_offline_chinese_and_can_hide_pronunciation() {
+        let body = r#"{
+                "article":"The glittered rose.",
+                "grade":"P4",
+                "customWords":"glittered==destello",
+                "targetLanguage":"es",
+                "pronunciationScheme":"none"
+            }"#;
+        let custom = json_string(body, "customWords").expect("custom words should parse");
+        let (entries, _, _) = parse_custom_annotations(&custom);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].zh, "destello");
+        let (mut lexicon, _, _, _) =
+            annotation_context(state(), &custom, "P4", "es").expect("context should build");
+        let entry = lookup_entry(state(), "glittered", &mut lexicon, false, false)
+            .expect("custom translation should override offline entries");
+        assert_eq!(entry.zh, "destello");
+        let (status, payload) = handle_preview(state(), body);
+        assert_eq!(status, 200);
+        assert!(payload.contains("destello"), "{payload}");
+        assert!(!payload.contains("闪闪发光"));
+        assert!(!payload.contains("ˈɡlɪt"));
     }
 
     #[test]
@@ -4670,10 +5797,14 @@ mod tests {
         let (preview, _) = render_preview_html(
             state(),
             "The glittered rose <script>alert('x')</script>.",
-            "Reading Test",
-            "glittered=ˈɡlɪt.ərd=闪闪发光",
-            true,
-            "P4",
+            PreviewOptions {
+                title: "Reading Test",
+                custom_annotations: "glittered=ˈɡlɪt.ərd=闪闪发光",
+                annotate_unknown: true,
+                grade_code: "P4",
+                target_language: "zh-Hans",
+                pronunciation_scheme: "ipa-us",
+            },
         )
         .expect("preview should render");
         assert!(preview.contains("preview-page"));
@@ -4690,6 +5821,8 @@ mod tests {
             "glittered=ˈɡlɪt.ərd=闪闪发光",
             true,
             "P4",
+            "zh-Hans",
+            "ipa-us",
             TextSizes::default_body(),
         );
         assert!(result.is_ok());
@@ -4710,17 +5843,17 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn opens_embedded_ui_by_default_on_windows() {
-        assert!(should_use_embedded_ui(&["词境精读.exe".to_string()]));
+        assert!(should_use_embedded_ui(&["语界精读.exe".to_string()]));
         assert!(!should_use_embedded_ui(&[
-            "词境精读.exe".to_string(),
+            "语界精读.exe".to_string(),
             "--browser".to_string(),
         ]));
         assert!(!should_use_embedded_ui(&[
-            "词境精读.exe".to_string(),
+            "语界精读.exe".to_string(),
             "--native".to_string(),
         ]));
         assert!(!should_use_embedded_ui(&[
-            "词境精读.exe".to_string(),
+            "语界精读.exe".to_string(),
             "--no-open".to_string(),
         ]));
     }

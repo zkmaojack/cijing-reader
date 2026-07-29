@@ -6,9 +6,9 @@
   --glass: rgba(243, 248, 255, 0.7);
   --glass-strong: rgba(247, 251, 255, 0.84);
   --glass-soft: rgba(239, 246, 255, 0.56);
-  --blue: #1769e0;
-  --blue-2: #5db7ff;
-  --blue-soft: rgba(44, 128, 232, 0.12);
+  --blue: #137c6c;
+  --blue-2: #e9a23b;
+  --blue-soft: rgba(32, 168, 139, 0.13);
   --green: #20a46b;
   --shadow: 0 28px 70px rgba(54, 86, 130, 0.18), 0 10px 28px rgba(66, 109, 160, 0.1);
   --inner-light: inset 0 0 0 1px rgba(86, 119, 164, 0.08);
@@ -28,9 +28,9 @@
   --glass: rgba(20, 26, 36, 0.66);
   --glass-strong: rgba(28, 35, 48, 0.82);
   --glass-soft: rgba(28, 35, 48, 0.5);
-  --blue: #76b7ff;
-  --blue-2: #3bd5c5;
-  --blue-soft: rgba(118, 183, 255, 0.16);
+  --blue: #55d4b8;
+  --blue-2: #f1b659;
+  --blue-soft: rgba(85, 212, 184, 0.16);
   --green: #4ad08f;
   --shadow: 0 28px 72px rgba(0, 0, 0, 0.38), 0 10px 28px rgba(0, 0, 0, 0.18);
   --inner-light: inset 0 0 0 1px rgba(176, 202, 235, 0.08);
@@ -156,21 +156,26 @@ textarea {
   place-items: center;
   width: clamp(42px, 3.2vw, 54px);
   height: clamp(42px, 3.2vw, 54px);
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  border-radius: clamp(14px, 1.1vw, 18px);
-  color: white;
-  background: linear-gradient(145deg, #1473ea, #71c9ff);
-  box-shadow: 0 16px 34px rgba(23, 105, 224, 0.32);
+  flex: 0 0 auto;
 }
 
-.brand-mark svg {
-  width: clamp(24px, 1.9vw, 31px);
-  height: clamp(24px, 1.9vw, 31px);
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 9px 12px rgba(18, 59, 58, 0.2));
+}
+
+.brand-copy {
+  min-width: 0;
+}
+
+.brand-copy p {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.12em;
 }
 
 h1,
@@ -268,7 +273,7 @@ p {
 .primary,
 .download {
   color: white;
-  background: linear-gradient(145deg, #1e80ff, #4da9ff 52%, #1769e0);
+  background: linear-gradient(145deg, #137c6c, #32a88b 58%, #0e665a);
   box-shadow: 0 16px 34px rgba(23, 105, 224, 0.32);
 }
 
@@ -280,7 +285,7 @@ p {
 .download:hover,
 .download:focus {
   color: #ffffff;
-  background: linear-gradient(145deg, #1e80ff, #4da9ff 52%, #1769e0);
+  background: linear-gradient(145deg, #137c6c, #32a88b 58%, #0e665a);
   font-size: 16px;
   font-weight: 760;
   text-shadow: 0 1px 10px rgba(0, 60, 160, 0.2);
@@ -305,7 +310,7 @@ p {
 :root[data-theme="dark"] .output-menu[open] > summary.primary,
 :root[data-theme="dark"] .download {
   color: #ffffff;
-  background: linear-gradient(145deg, #227bff, #26c7cc 58%, #1766d8);
+  background: linear-gradient(145deg, #198b77, #32b89a 58%, #116c60);
 }
 
 .busy {
@@ -443,6 +448,15 @@ select:focus {
   scrollbar-gutter: stable;
 }
 
+:root[dir="rtl"] #article,
+:root[dir="rtl"] #title,
+:root[dir="rtl"] #customWords,
+:root[dir="rtl"] .article-highlights-content,
+:root[dir="rtl"] .preview-page {
+  direction: ltr;
+  text-align: left;
+}
+
 #article:focus {
   border: 0;
   background: transparent;
@@ -457,6 +471,30 @@ select:focus {
 
 .settings-card {
   margin: 0 0 20px;
+}
+
+.language-card {
+  border-color: rgba(32, 168, 139, 0.28);
+  background:
+    linear-gradient(145deg, rgba(50, 168, 139, 0.08), rgba(233, 162, 59, 0.06)),
+    rgba(247, 251, 255, 0.58);
+}
+
+:root[data-theme="dark"] .language-card {
+  border-color: rgba(85, 212, 184, 0.22);
+  background:
+    linear-gradient(145deg, rgba(50, 168, 139, 0.1), rgba(233, 162, 59, 0.07)),
+    rgba(28, 35, 48, 0.64);
+}
+
+.field-note {
+  margin: -2px 0 4px;
+  padding: 10px 11px;
+  border-radius: 12px;
+  color: var(--muted);
+  background: var(--blue-soft);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .settings label {
@@ -1790,9 +1828,8 @@ input[type="range"]:focus {
     border-radius: 13px;
   }
 
-  .brand-mark svg {
-    width: 23px;
-    height: 23px;
+  .brand-copy p {
+    display: none;
   }
 
   .editor,
@@ -1947,9 +1984,8 @@ input[type="range"]:focus {
   border-radius: 13px;
 }
 
-:root.host-compact-height .brand-mark svg {
-  width: 23px;
-  height: 23px;
+:root.host-compact-height .brand-copy p {
+  display: none;
 }
 
 :root.host-compact-height .editor,

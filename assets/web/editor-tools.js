@@ -11,7 +11,11 @@
   const FIELD_IDS = [
     "title",
     "customWords",
+    "autoTranslations",
+    "autoTranslationCache",
     "grade",
+    "translationLanguage",
+    "pronunciationScheme",
     "annotateUnknown",
     "englishSize",
     "ipaSize",
@@ -52,6 +56,15 @@
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+  const t = (key, fallback, variables) => {
+    const translated = window.YujieI18n?.t?.(key, variables);
+    return translated && translated !== key ? translated : fallback;
+  };
+
+  function kindLabel(kind) {
+    const fallback = KIND_LABELS[kind] || "标注";
+    return t(`annotation.kind.${kind}`, fallback);
+  }
 
   function escapeHtml(value) {
     return String(value)
@@ -84,8 +97,11 @@
       .map((part) => part.trim())
       .filter(Boolean).length;
     const minutes = words ? Math.max(1, Math.ceil(words / 180)) : 0;
-    $("#textStats").textContent =
-      `${words} 词 · ${sentences} 句 · ${paragraphs} 段 · ${minutes} 分钟`;
+    $("#textStats").textContent = t(
+      "editor.stats",
+      `${words} 词 · ${sentences} 句 · ${paragraphs} 段 · ${minutes} 分钟`,
+      { words, sentences, paragraphs, minutes },
+    );
   }
 
   function annotationId() {
@@ -196,8 +212,8 @@
   }
 
   function annotationTitle(item) {
-    if (item.term) return `${KIND_LABELS[item.kind] || "标注"} · ${item.term}`;
-    return KIND_LABELS[item.kind] || "标注";
+    if (item.term) return `${kindLabel(item.kind)} · ${item.term}`;
+    return kindLabel(item.kind);
   }
 
   function renderAnnotationList() {
@@ -207,7 +223,10 @@
     if (!editorState.annotations.length) {
       const empty = document.createElement("p");
       empty.className = "annotation-empty";
-      empty.textContent = "选择单词、句子或段落后即可添加标注。";
+      empty.textContent = t(
+        "settings.noAnnotations",
+        "选择单词、句子或段落后即可添加标注。",
+      );
       list.appendChild(empty);
       return;
     }
@@ -227,7 +246,8 @@
         const excerpt = document.createElement("p");
         excerpt.textContent = `“${item.excerpt || editorState.article.value.slice(item.start, item.end)}”`;
         const note = document.createElement("small");
-        note.textContent = item.note || item.definition || "无附加备注";
+        note.textContent =
+          item.note || item.definition || t("annotation.noNote", "无附加备注");
         main.append(title, excerpt, note);
         main.addEventListener("click", () => selectAnnotation(item));
         main.addEventListener("keydown", (event) => {
@@ -239,7 +259,7 @@
         const remove = document.createElement("button");
         remove.type = "button";
         remove.className = "annotation-delete";
-        remove.setAttribute("aria-label", "删除标注");
+        remove.setAttribute("aria-label", t("annotation.delete", "删除标注"));
         remove.textContent = "×";
         remove.addEventListener("click", () => {
           editorState.annotations = editorState.annotations.filter(
@@ -447,7 +467,11 @@
     const response = await fetch("/api/dictionary", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ word }),
+      body: JSON.stringify({
+        word,
+        targetLanguage: $("#translationLanguage")?.value || "zh-Hans",
+        pronunciationScheme: $("#pronunciationScheme")?.value || "ipa-us",
+      }),
     });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || "词典查询失败");
@@ -456,7 +480,7 @@
 
   async function fillWordLookup(word) {
     const status = $("#wordLookupStatus");
-    status.textContent = "正在查询本地词典…";
+    status.textContent = t("dictionary.loading", "正在查询本地词典…");
     try {
       const data = await lookupWord(word);
       if (data.found) {
@@ -464,15 +488,25 @@
         if (!$("#wordDefinition").value) {
           $("#wordDefinition").value = data.definition || "";
         }
-        status.textContent = data.term && normalizeWord(data.term) !== normalizeWord(word)
-          ? `已按原形 ${data.term} 查询；可能原形：${(data.forms || []).join("、")}`
-          : "已从本地词典补全";
+        if (data.definition) {
+          status.textContent = data.term && normalizeWord(data.term) !== normalizeWord(word)
+            ? `已按原形 ${data.term} 查询；可能原形：${(data.forms || []).join("、")}`
+            : t("dictionary.completed", "已从本地词典补全");
+        } else {
+          status.textContent = t(
+            "dictionary.pronunciationOnly",
+            "已补全内置音标；当前目标语暂未找到内置释义。",
+          );
+        }
       } else {
-        status.textContent = "本地词典暂未收录，可手动填写或使用右侧网络词库。";
+        status.textContent = t(
+          "dictionary.notFound",
+          "内置词典暂未收录，可手动填写释义。",
+        );
       }
       return data;
     } catch (error) {
-      status.textContent = error.message || "词典查询失败";
+      status.textContent = error.message || t("dictionary.failed", "词典查询失败");
       return null;
     }
   }
@@ -534,7 +568,7 @@
     if (!word) return "";
     if (entry.status === "ignore") return `!${word}`;
     const prefix = entry.status === "important" ? "*" : "";
-    if (entry.ipa.trim() && entry.definition.trim()) {
+    if (entry.ipa.trim() || entry.definition.trim()) {
       return `${prefix}${word}=${entry.ipa.trim()}=${entry.definition.trim()}`;
     }
     return `${prefix}${word}`;
@@ -626,7 +660,7 @@
     editorState.dictionaryResult = null;
     $("#dictionaryWord").textContent = word;
     $("#dictionaryIpa").textContent = "";
-    $("#dictionaryDefinition").textContent = "正在查询本地词典…";
+    $("#dictionaryDefinition").textContent = t("dictionary.loading", "正在查询本地词典…");
     $("#dictionaryForms").textContent = "";
     popover.hidden = false;
     const width = 330;
@@ -637,13 +671,14 @@
       editorState.dictionaryResult = data;
       $("#dictionaryIpa").textContent = data.ipa || "";
       $("#dictionaryDefinition").textContent = data.found
-        ? data.definition || "词典中暂无中文释义"
-        : "本地词典暂未收录，可加入词汇标注后手动填写。";
+        ? data.definition || t("dictionary.noDefinition", "当前目标语暂无释义")
+        : t("dictionary.notFound", "内置词典暂未收录，可手动填写释义。");
       $("#dictionaryForms").textContent = data.forms?.length
         ? `可能原形：${data.forms.join("、")}`
         : "";
     } catch (error) {
-      $("#dictionaryDefinition").textContent = error.message || "词典查询失败";
+      $("#dictionaryDefinition").textContent =
+        error.message || t("dictionary.failed", "词典查询失败");
     }
   }
 
@@ -964,6 +999,8 @@
       article: draft.article,
       title: draft.fields?.title,
       customWords: draft.fields?.customWords,
+      autoTranslations: draft.fields?.autoTranslations,
+      autoTranslationCache: draft.fields?.autoTranslationCache,
       annotations: draft.annotations,
     });
   }
@@ -989,29 +1026,35 @@
       localStorage.setItem(DRAFT_KEY, JSON.stringify(collectDraft()));
       const status = $("#draftStatus");
       status.className = "saved";
-      status.textContent = `已自动保存 ${new Date().toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      })}`;
+      const time =
+        window.YujieI18n?.formatTime?.(Date.now()) ||
+        new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      status.textContent = t("editor.autoSaved", `已自动保存 ${time}`, { time });
       if (Date.now() - editorState.lastHistoryAt > HISTORY_INTERVAL) {
         captureHistory();
       }
     } catch {
       $("#draftStatus").className = "";
-      $("#draftStatus").textContent = "草稿保存失败";
+      $("#draftStatus").textContent = t("editor.saveFailed", "草稿保存失败");
     }
   }
 
   function scheduleDraftSave() {
     const status = $("#draftStatus");
     status.className = "saving";
-    status.textContent = "正在保存…";
+    status.textContent = t("editor.saving", "正在保存…");
     clearTimeout(editorState.draftTimer);
     editorState.draftTimer = setTimeout(saveDraft, AUTOSAVE_DELAY);
   }
 
   function applyDraft(draft) {
     if (!draft || typeof draft !== "object") return false;
+    ["autoTranslations", "autoTranslationCache"].forEach((id) => {
+      if (draft.fields?.[id] === undefined) {
+        const element = $(`#${id}`);
+        if (element) element.value = "";
+      }
+    });
     FIELD_IDS.forEach((id) => {
       const element = $(`#${id}`);
       if (!element || draft.fields?.[id] === undefined) return;
@@ -1029,7 +1072,7 @@
     updateStats();
     renderAllAnnotations();
     $("#draftStatus").className = "saved";
-    $("#draftStatus").textContent = "已恢复草稿";
+    $("#draftStatus").textContent = t("editor.restored", "已恢复草稿");
     editorState.options.onRestore?.();
     return true;
   }
@@ -1050,7 +1093,10 @@
     if (!history.length) {
       const empty = document.createElement("p");
       empty.className = "history-empty";
-      empty.textContent = "尚未生成历史版本。继续编辑后会自动保存。";
+      empty.textContent = t(
+        "history.empty",
+        "尚未生成历史版本。继续编辑后会自动保存。",
+      );
       list.appendChild(empty);
       return;
     }
@@ -1059,11 +1105,12 @@
       row.className = "history-item";
       const main = document.createElement("div");
       const title = document.createElement("strong");
-      title.textContent = entry.draft?.fields?.title?.trim() || "未命名文章";
+      title.textContent =
+        entry.draft?.fields?.title?.trim() || t("history.untitled", "未命名文章");
       const preview = document.createElement("p");
       preview.textContent =
         String(entry.draft?.article || "").replace(/\s+/g, " ").slice(0, 100) ||
-        "空白草稿";
+        t("history.blank", "空白草稿");
       const meta = document.createElement("small");
       meta.textContent =
         `${new Date(entry.timestamp).toLocaleString()} · ${entry.reason || "自动版本"} · ` +
@@ -1074,7 +1121,7 @@
       const restore = document.createElement("button");
       restore.type = "button";
       restore.className = "tool-button";
-      restore.textContent = "恢复";
+      restore.textContent = t("action.restore", "恢复");
       restore.addEventListener("click", () => {
         captureHistory("恢复前");
         applyDraft(entry.draft);
@@ -1297,6 +1344,22 @@
         captureHistory(reason);
       },
       notifyFieldsChanged: scheduleDraftSave,
+      refreshLocale() {
+        updateStats();
+        renderAllAnnotations();
+        updateSelectionBar();
+        const draftStatus = $("#draftStatus");
+        if (draftStatus.classList.contains("saving")) {
+          draftStatus.textContent = t("editor.saving", "正在保存…");
+        } else if (draftStatus.classList.contains("saved")) {
+          const time =
+            window.YujieI18n?.formatTime?.(Date.now()) ||
+            new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          draftStatus.textContent = t("editor.autoSaved", `已自动保存 ${time}`, { time });
+        } else {
+          draftStatus.textContent = t("editor.waiting", "等待编辑");
+        }
+      },
       applyPreviewAnnotations,
       openVocabularyManager,
     };

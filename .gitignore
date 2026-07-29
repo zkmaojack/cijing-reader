@@ -1,5 +1,11 @@
 /target/
 /target-verify/
 /output/
+/.mt-build/
+/assets/web/ui-packs/
+**/__pycache__/
+*.py[cod]
 *.exe
 *.log
+*.zip
+*.exe.WebView2/
