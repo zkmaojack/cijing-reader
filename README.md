@@ -6,7 +6,9 @@
 
 语界精读是一款面向语言学习者的 Windows 精读工具。粘贴英文文章后，软件会根据学生年级与词汇规则标注单词，并生成适合阅读、打印和分享的排版预览。
 
-官网：[zkmaojack.github.io/cijing-reader](https://zkmaojack.github.io/cijing-reader/)
+项目网站：[zkmaojack.github.io/cijing](https://zkmaojack.github.io/cijing/)
+
+个人作品主页：[zkmaojack.github.io](https://zkmaojack.github.io/)
 
 ## 功能
 
