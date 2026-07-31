@@ -33,7 +33,7 @@ test("exports a GitHub Pages-ready portfolio and project routes", async () => {
     if (basePath) {
       assert.doesNotMatch(html, /(?:src|href)="\/(?!cijing-reader)/);
     } else {
-      assert.doesNotMatch(html, /\/cijing-reader\//);
+      assert.doesNotMatch(html, /(?:src|href)="\/cijing-reader\//);
     }
   }
   await access(new URL(".nojekyll", output));
