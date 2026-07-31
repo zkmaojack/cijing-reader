@@ -37,6 +37,7 @@ const RELEASE = {
 };
 
 const navItems: Array<{ href: string; label: Localized }> = [
+  { href: `${PUBLIC_BASE_PATH}/`, label: { zh: "作品集", en: "Portfolio" } },
   { href: "#demo", label: { zh: "互动演示", en: "Live demo" } },
   { href: "#features", label: { zh: "功能", en: "Features" } },
   { href: "#workflow", label: { zh: "使用方式", en: "Workflow" } },
@@ -363,7 +364,11 @@ export default function HomeClient() {
       </a>
 
       <header className="topbar">
-        <a className="brand" href="#top" aria-label={locale === "zh" ? "语界精读首页" : "Yujie Reader home"}>
+        <a
+          className="brand"
+          href={`${PUBLIC_BASE_PATH}/`}
+          aria-label={locale === "zh" ? "返回作品集" : "Back to portfolio"}
+        >
           <img src={publicAsset("/yujie-logo.png")} alt="" width="46" height="46" />
           <span className="brand-copy">
             <strong>语界精读</strong>

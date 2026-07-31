@@ -12,52 +12,55 @@ const publicAsset = (pathname: string) =>
   `${siteOrigin}${basePath}${pathname}`;
 
 export const metadata: Metadata = {
-    metadataBase: new URL(canonicalUrl),
-    title: "语界精读｜把英文文章变成适合学生年级的精读讲义",
+  metadataBase: new URL(canonicalUrl),
+  title: {
+    default: "Jack Mao · 独立作品｜语界精读 × FlowLab 2D",
+    template: "%s · Jack Mao",
+  },
+  description:
+    "Jack Mao 的独立软件作品集：语界精读英语学习工具与 FlowLab 2D 实时二维流体仿真工作台。",
+  applicationName: "Jack Mao · Selected Works",
+  keywords: [
+    "Jack Mao",
+    "独立开发",
+    "语界精读",
+    "Yujie Reader",
+    "FlowLab 2D",
+    "二维流体仿真",
+  ],
+  authors: [{ name: "Jack Mao", url: "https://github.com/zkmaojack" }],
+  alternates: {
+    canonical: canonicalUrl,
+  },
+  icons: {
+    icon: `${basePath}/favicon.ico`,
+    shortcut: `${basePath}/favicon.ico`,
+    apple: `${basePath}/yujie-logo.png`,
+  },
+  openGraph: {
+    type: "website",
+    locale: "zh_CN",
+    alternateLocale: "en_US",
+    url: canonicalUrl,
+    siteName: "Jack Mao · Selected Works",
+    title: "Jack Mao · 独立作品",
     description:
-      "Windows 英语精读工具：按年级标出生词，生成释义与注音，添加句段讲解，并导出 DOCX / PDF。",
-    applicationName: "语界精读 · Yujie Reader",
-    keywords: [
-      "英语精读",
-      "分级词汇",
-      "英语学习",
-      "教师讲义",
-      "IPA",
-      "Yujie Reader",
+      "一件帮助人读懂语言，一件帮助人看见流动。探索语界精读与 FlowLab 2D。",
+    images: [
+      {
+        url: publicAsset("/og.png"),
+        width: 1734,
+        height: 907,
+        alt: "Jack Mao 独立作品：Cijing Reader 与 FlowLab 2D",
+      },
     ],
-    authors: [{ name: "Yujie Reader" }],
-    alternates: {
-      canonical: canonicalUrl,
-    },
-    icons: {
-      icon: `${basePath}/favicon.ico`,
-      shortcut: `${basePath}/favicon.ico`,
-      apple: `${basePath}/yujie-logo.png`,
-    },
-    openGraph: {
-      type: "website",
-      locale: "zh_CN",
-      alternateLocale: "en_US",
-      url: canonicalUrl,
-      siteName: "语界精读 · Yujie Reader",
-      title: "语界精读｜把英文文章读成自己的语言地图",
-      description:
-        "按学生年级标出生词，补充释义、注音和句段讲解，再直接导出精读讲义。",
-      images: [
-        {
-          url: publicAsset("/og.png"),
-          width: basePath ? 512 : 1200,
-          height: basePath ? 512 : 630,
-          alt: "语界精读 · 在语境中，读懂世界",
-        },
-      ],
-    },
-    twitter: {
-      card: "summary_large_image",
-      title: "语界精读｜Yujie Reader",
-      description: "把任意英文文章，变成适合学生年级的精读讲义。",
-      images: [publicAsset("/og.png")],
-    },
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Jack Mao · Selected Works",
+    description: "Cijing Reader × FlowLab 2D",
+    images: [publicAsset("/og.png")],
+  },
 };
 
 export default function RootLayout({

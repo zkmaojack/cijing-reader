@@ -1,0 +1,121 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="1024"
+  height="1024"
+  viewBox="0 0 1024 1024"
+  fill="none"
+  role="img"
+  aria-labelledby="flowlab-logo-title flowlab-logo-description"
+>
+  <title id="flowlab-logo-title">FlowLab 2D</title>
+  <desc id="flowlab-logo-description">
+    Four fluid streamlines curve around a smooth F-shaped obstacle.
+  </desc>
+
+  <defs>
+    <linearGradient id="flowlab-background" x1="170" y1="92" x2="862" y2="932" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#12383B" />
+      <stop offset="0.52" stop-color="#092326" />
+      <stop offset="1" stop-color="#061416" />
+    </linearGradient>
+    <radialGradient
+      id="flowlab-glow"
+      cx="0"
+      cy="0"
+      r="1"
+      gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(308 244) rotate(48) scale(780)"
+    >
+      <stop stop-color="#55E8D7" stop-opacity="0.23" />
+      <stop offset="0.64" stop-color="#55E8D7" stop-opacity="0.035" />
+      <stop offset="1" stop-color="#55E8D7" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="flowlab-stream" x1="122" y1="512" x2="902" y2="512" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#55E8D7" stop-opacity="0.42" />
+      <stop offset="0.3" stop-color="#55E8D7" />
+      <stop offset="0.75" stop-color="#8DF5E9" />
+      <stop offset="1" stop-color="#55E8D7" stop-opacity="0.56" />
+    </linearGradient>
+    <linearGradient id="flowlab-obstacle" x1="438" y1="358" x2="672" y2="694" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F2FFFD" />
+      <stop offset="1" stop-color="#B9F8EF" />
+    </linearGradient>
+    <filter id="flowlab-obstacle-shadow" x="350" y="282" width="440" height="512" filterUnits="userSpaceOnUse">
+      <feFlood flood-opacity="0" result="BackgroundImageFix" />
+      <feColorMatrix
+        in="SourceAlpha"
+        type="matrix"
+        values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"
+        result="hardAlpha"
+      />
+      <feOffset dy="22" />
+      <feGaussianBlur stdDeviation="24" />
+      <feComposite in2="hardAlpha" operator="out" />
+      <feColorMatrix type="matrix" values="0 0 0 0 0.01 0 0 0 0 0.06 0 0 0 0 0.07 0 0 0 0.55 0" />
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow" />
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow" result="shape" />
+    </filter>
+    <clipPath id="flowlab-app-tile">
+      <rect x="32" y="32" width="960" height="960" rx="224" />
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#flowlab-app-tile)">
+    <rect x="32" y="32" width="960" height="960" fill="url(#flowlab-background)" />
+    <rect x="32" y="32" width="960" height="960" fill="url(#flowlab-glow)" />
+
+    <g
+      fill="none"
+      stroke="url(#flowlab-stream)"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    >
+      <path d="M104 302C272 302 305 244 454 232C644 216 711 304 920 304" stroke-width="34" />
+      <path d="M104 414C276 414 310 332 460 320C642 305 722 410 920 410" stroke-width="25" />
+      <path d="M104 606C276 606 310 692 460 706C644 724 724 614 920 614" stroke-width="25" />
+      <path d="M104 718C270 718 306 782 458 794C650 810 716 718 920 718" stroke-width="34" />
+    </g>
+
+    <path
+      d="M122 510H284C341 510 363 492 393 452"
+      stroke="#FFB86B"
+      stroke-width="28"
+      stroke-linecap="round"
+    />
+    <path
+      d="M718 512C751 512 777 510 807 510H918"
+      stroke="#FFB86B"
+      stroke-width="28"
+      stroke-linecap="round"
+    />
+
+    <g filter="url(#flowlab-obstacle-shadow)">
+      <path
+        d="M454 682V374C454 350 473 330 498 330H686"
+        stroke="url(#flowlab-obstacle)"
+        stroke-width="96"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+      <path
+        d="M478 504H636"
+        stroke="url(#flowlab-obstacle)"
+        stroke-width="96"
+        stroke-linecap="round"
+      />
+    </g>
+
+    <circle cx="860" cy="510" r="14" fill="#FFF1DE" />
+  </g>
+
+  <rect
+    x="48"
+    y="48"
+    width="928"
+    height="928"
+    rx="208"
+    stroke="#8DF5E9"
+    stroke-opacity="0.17"
+    stroke-width="8"
+  />
+</svg>
